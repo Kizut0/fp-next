@@ -3,6 +3,20 @@ import { cleanDoc, cleanDocs, json, options, requireAuth, toObjectId } from "../
 
 export const dynamic = "force-dynamic";
 
+function buildMineOwnerMatch(user) {
+  const ownerId = String(user?.id || "").trim();
+  if (!ownerId) return null;
+
+  const ownerObjectId = toObjectId(ownerId);
+  const clauses = [{ clientId: ownerId }, { userId: ownerId }, { ownerId }];
+
+  if (ownerObjectId) {
+    clauses.push({ clientId: ownerObjectId }, { userId: ownerObjectId }, { ownerId: ownerObjectId });
+  }
+
+  return clauses;
+}
+
 export async function OPTIONS(req) {
   return options(req);
 }
@@ -27,7 +41,9 @@ export async function GET(req) {
     }
 
     if (mine === "client" || auth.user.role === "Client") {
-      query.clientId = auth.user.id;
+      const ownerMatch = buildMineOwnerMatch(auth.user);
+      if (ownerMatch) query.$or = ownerMatch;
+      else query.clientId = auth.user.id;
     }
 
     const db = await getDb();
@@ -55,14 +71,20 @@ export async function POST(req) {
     const proposals = db.collection("proposals");
 
     const jobObjectId = toObjectId(payload.jobId);
-    const job = await jobs.findOne({ _id: jobObjectId || payload.jobId });
+    const jobQuery = jobObjectId
+      ? { $or: [{ _id: jobObjectId }, { _id: payload.jobId }, { jobId: payload.jobId }] }
+      : { $or: [{ _id: payload.jobId }, { jobId: payload.jobId }] };
+
+    const job = await jobs.findOne(jobQuery);
     if (!job) return json({ message: "Job not found" }, 404);
 
     const now = new Date();
+    const clientId = String(job.clientId || job.userId || job.ownerId || job.createdBy || "").trim();
+
     const doc = {
       jobId: job._id,
       jobTitle: job.title,
-      clientId: job.clientId,
+      clientId,
       freelancerId: auth.user.id,
       price: Number(payload.price || 0),
       message: payload.message || "",
@@ -72,6 +94,12 @@ export async function POST(req) {
     };
 
     const result = await proposals.insertOne(doc);
+
+    await jobs.updateOne(
+      { _id: job._id },
+      { $inc: { proposalsCount: 1 }, $set: { updatedAt: new Date() } }
+    );
+
     return json(cleanDoc({ ...doc, _id: result.insertedId }), 201);
   } catch (error) {
     return json({ message: "Failed to submit proposal", error: error.message }, 500);

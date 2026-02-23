@@ -20,7 +20,7 @@ function buildCorsHeaders(origin) {
     };
 }
 
-export function middleware(req) {
+export function proxy(req) {
     if (!req.nextUrl.pathname.startsWith("/api/")) {
         return NextResponse.next();
     }

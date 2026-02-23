@@ -27,6 +27,9 @@ function toSkillsArray(value) {
 }
 
 function parseNumber(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }

@@ -158,8 +158,8 @@ export async function DELETE(req, { params }) {
     const contract = await contracts.findOne(query);
     if (!contract) return json({ message: "Contract not found" }, 404, req);
 
-    if (!canMutateContract(auth.user, contract)) {
-      return json({ message: "Forbidden" }, 403, req);
+    if (auth.user.role !== "Admin") {
+      return json({ message: "Only admin can delete contracts" }, 403, req);
     }
 
     await contracts.deleteOne({ _id: contract._id });

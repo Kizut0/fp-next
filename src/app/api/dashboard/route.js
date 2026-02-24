@@ -1,7 +1,31 @@
 import { getDb } from "../../../lib/mongodb";
-import { json, options, requireAuth } from "../../../lib/api";
+import { json, options, requireAuth, toObjectId } from "../../../lib/api";
 
 export const dynamic = "force-dynamic";
+
+function buildOwnerCountQuery(userId) {
+  const ownerId = String(userId || "").trim();
+  if (!ownerId) return { clientId: "__no_owner__" };
+
+  const ownerObjectId = toObjectId(ownerId);
+  const clauses = [
+    { clientId: ownerId },
+    { userId: ownerId },
+    { ownerId },
+    { createdBy: ownerId },
+  ];
+
+  if (ownerObjectId) {
+    clauses.push(
+      { clientId: ownerObjectId },
+      { userId: ownerObjectId },
+      { ownerId: ownerObjectId },
+      { createdBy: ownerObjectId }
+    );
+  }
+
+  return { $or: clauses };
+}
 
 export async function OPTIONS(req) {
   return options(req);
@@ -45,8 +69,10 @@ export async function GET(req) {
       });
     }
 
+    const ownerQuery = buildOwnerCountQuery(auth.user.id);
+
     const [postedJobs, activeContracts, paidCount] = await Promise.all([
-      db.collection(process.env.JOB_COLLECTION || "Job").countDocuments({ clientId: auth.user.id }),
+      db.collection(process.env.JOB_COLLECTION || "Job").countDocuments(ownerQuery),
       db.collection("contracts").countDocuments({ clientId: auth.user.id, status: "active" }),
       db.collection("payments").countDocuments({ clientId: auth.user.id }),
     ]);

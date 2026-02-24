@@ -10,6 +10,28 @@ function normalizeStatus(value) {
   return MUTABLE_STATUSES.includes(raw) ? raw : "submitted";
 }
 
+function normalizeRole(value) {
+  const role = String(value || "").trim().toLowerCase();
+  if (role === "freelance") return "freelancer";
+  return role;
+}
+
+function canSubmitProposals(role) {
+  const normalized = normalizeRole(role);
+  return normalized === "freelancer" || normalized === "admin";
+}
+
+async function resolveCurrentRoleFromDb(db, userId) {
+  const id = String(userId || "").trim();
+  if (!id) return "";
+
+  const users = db.collection(process.env.USER_COLLECTION || "userData");
+  const objectId = toObjectId(id);
+  const query = objectId ? { _id: objectId } : { _id: id };
+  const user = await users.findOne(query, { projection: { role: 1 } });
+  return String(user?.role || "").trim();
+}
+
 function buildMineOwnerMatch(user) {
   const ownerId = String(user?.id || "").trim();
   if (!ownerId) return null;
@@ -88,11 +110,24 @@ export async function POST(req) {
   const auth = requireAuth(req);
   if (auth.error) return auth.error;
 
-  if (auth.user.role !== "Freelancer" && auth.user.role !== "Admin") {
-    return json({ message: "Only freelancers can submit proposals" }, 403, req);
-  }
-
   try {
+    const db = await getDb();
+    const tokenRole = String(auth.user.role || "").trim();
+    const dbRole = await resolveCurrentRoleFromDb(db, auth.user.id);
+    const effectiveRole = canSubmitProposals(tokenRole) ? tokenRole : dbRole;
+
+    if (!canSubmitProposals(effectiveRole)) {
+      return json(
+        {
+          message: "Only freelancers can submit proposals",
+          role: tokenRole || "",
+          dbRole: dbRole || "",
+        },
+        403,
+        req
+      );
+    }
+
     const payload = await req.json();
     const jobId = String(payload.jobId || "").trim();
     const price = Number(payload.price || 0);
@@ -102,7 +137,6 @@ export async function POST(req) {
     if (!Number.isFinite(price) || price <= 0) return json({ message: "Price must be greater than 0" }, 400, req);
     if (message.length < 20) return json({ message: "Message must be at least 20 characters" }, 400, req);
 
-    const db = await getDb();
     const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
     const proposals = db.collection("proposals");
 

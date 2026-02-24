@@ -39,6 +39,19 @@ function normalizeAttachment(input) {
   return { name, type, size, dataUrl };
 }
 
+function normalizeId(value) {
+  return String(value || "").trim();
+}
+
+function resolveContractClientId(contract) {
+  return (
+    normalizeId(contract.clientId) ||
+    normalizeId(contract.userId) ||
+    normalizeId(contract.ownerId) ||
+    normalizeId(contract.createdBy)
+  );
+}
+
 function canClientDecide(authUser, contract) {
   if (authUser.role === "Admin") return true;
 
@@ -161,6 +174,33 @@ export async function PATCH(req, { params }) {
           },
         }
       );
+
+      const payments = db.collection("payments");
+      const canonicalId = normalizeId(contract._id || contract.contractId);
+      const altId = normalizeId(contract.contractId);
+
+      const existingPayment = await payments.findOne({
+        $or: [{ contractId: canonicalId }, ...(altId ? [{ contractId: altId }] : [])],
+      });
+
+      if (!existingPayment) {
+        const clientId = resolveContractClientId(contract);
+        const freelancerId = normalizeId(contract.freelancerId);
+        const amount = Number(contract.amount || 0);
+
+        if (clientId && freelancerId && Number.isFinite(amount) && amount > 0) {
+          await payments.insertOne({
+            contractId: canonicalId || altId,
+            clientId,
+            freelancerId,
+            amount,
+            status: "pending",
+            note: "Auto-created after client accepted completed work",
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+      }
     }
 
     if (action === "reject") {

@@ -25,6 +25,35 @@ function canCompleteContract(authUser, contract) {
   return ownerIds.includes(userId);
 }
 
+function normalizeText(value, maxLen = 500) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return text.slice(0, maxLen);
+}
+
+function normalizeUrl(value) {
+  const raw = normalizeText(value, 1000);
+  if (!raw) return "";
+
+  if (/^https?:\/\//i.test(raw)) return raw;
+  return "";
+}
+
+function normalizeAttachment(input) {
+  if (!input || typeof input !== "object") return null;
+
+  const name = normalizeText(input.name, 200);
+  const type = normalizeText(input.type, 100);
+  const dataUrl = normalizeText(input.dataUrl, 2_500_000);
+  const size = Number(input.size || 0);
+
+  if (!name || !dataUrl) return null;
+  if (!Number.isFinite(size) || size <= 0 || size > 2_000_000) return null;
+  if (!/^data:/i.test(dataUrl)) return null;
+
+  return { name, type, size, dataUrl };
+}
+
 async function getParamId(params) {
   const resolved = await params;
   return String(resolved?.id || "").trim();
@@ -52,17 +81,42 @@ export async function PATCH(req, { params }) {
       return json({ message: "Forbidden" }, 403, req);
     }
 
+    let payload = {};
+    try {
+      payload = await req.json();
+    } catch {
+      payload = {};
+    }
+
+    const deliveryLink = normalizeUrl(payload.deliveryLink);
+    const notes = normalizeText(payload.deliveryNotes, 1500);
+    const attachment = normalizeAttachment(payload.deliveryAttachment);
+
+    const authId = String(auth.user.id || "").trim();
+    const freelancerId = String(contract.freelancerId || "").trim();
+    const isFreelancer = auth.user.role === "Freelancer" && authId && freelancerId && authId === freelancerId;
+    const canWriteDelivery = isFreelancer || auth.user.role === "Admin";
+
     const now = new Date();
+    const update = {
+      status: "completed",
+      endDate: contract.endDate || now,
+      updatedAt: now,
+    };
+
+    if (canWriteDelivery && (deliveryLink || notes || attachment)) {
+      update.delivery = {
+        link: deliveryLink || "",
+        notes: notes || "",
+        attachment: attachment || null,
+        submittedBy: authId,
+        submittedAt: now,
+      };
+    }
 
     await contracts.updateOne(
       { _id: contract._id },
-      {
-        $set: {
-          status: "completed",
-          endDate: contract.endDate || now,
-          updatedAt: now,
-        },
-      }
+      { $set: update }
     );
 
     const updated = await contracts.findOne({ _id: contract._id });

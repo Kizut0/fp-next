@@ -47,8 +47,12 @@ export async function POST(req) {
             return json({ message: "Password is incorrect", field: "password" }, 401);
         }
 
-        if (user.status === "blocked") {
+        const status = String(user.status || "active").trim().toLowerCase();
+        if (status === "blocked") {
             return json({ message: "Account is blocked" }, 403);
+        }
+        if (["deactive", "deactivated", "inactive"].includes(status)) {
+            return json({ message: "Account is deactivated" }, 403);
         }
 
         const token = signToken({

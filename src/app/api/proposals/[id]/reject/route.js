@@ -43,6 +43,14 @@ function normalizeJobQuery(rawId) {
   return { $or: [{ _id: id }, { jobId: id }] };
 }
 
+function getReservedAmount(proposal = {}) {
+  const reserved = Number(proposal.reservedAmount);
+  if (Number.isFinite(reserved) && reserved > 0) return reserved;
+
+  const price = Number(proposal.price);
+  return Number.isFinite(price) && price > 0 ? price : 0;
+}
+
 async function getParamId(params) {
   const resolved = await params;
   return String(resolved?.id || "").trim();
@@ -86,10 +94,18 @@ export async function PATCH(req, { params }) {
       return json({ message: "Only submitted proposals can be rejected" }, 400, req);
     }
 
+    const now = new Date();
     await proposals.updateOne(
       { _id: proposal._id },
-      { $set: { status: "rejected", updatedAt: new Date() } }
+      { $set: { status: "rejected", updatedAt: now } }
     );
+
+    if (jobQuery) {
+      const amount = getReservedAmount(proposal);
+      if (amount > 0) {
+        await jobs.updateOne(jobQuery, { $inc: { budget: amount }, $set: { updatedAt: now } });
+      }
+    }
 
     return json({ ok: true }, 200, req);
   } catch (error) {

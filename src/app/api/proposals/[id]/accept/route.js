@@ -44,6 +44,25 @@ function normalizeJobQuery(jobId) {
   return { $or: [{ _id: raw }, { jobId: raw }] };
 }
 
+function normalizeBudget(value) {
+  const budget = Number(value);
+  return Number.isFinite(budget) && budget > 0 ? budget : 0;
+}
+
+function sameId(a, b) {
+  const left = String(a || "").trim();
+  const right = String(b || "").trim();
+  return Boolean(left && right && left === right);
+}
+
+function getReservedAmount(proposal = {}) {
+  const reserved = Number(proposal.reservedAmount);
+  if (Number.isFinite(reserved) && reserved > 0) return reserved;
+
+  const price = Number(proposal.price);
+  return Number.isFinite(price) && price > 0 ? price : 0;
+}
+
 async function getParamId(params) {
   const resolved = await params;
   return String(resolved?.id || "").trim();
@@ -90,6 +109,36 @@ export async function PATCH(req, { params }) {
       return json({ message: "Only submitted proposals can be accepted" }, 400, req);
     }
 
+    const job = jobQuery ? await jobs.findOne(jobQuery) : null;
+    const proposalPrice = Number(proposal.price || 0);
+    if (!Number.isFinite(proposalPrice) || proposalPrice <= 0) {
+      return json({ message: "Invalid proposal amount" }, 400, req);
+    }
+
+    const proposalReserved = getReservedAmount(proposal);
+    const requiredExtra = Math.max(0, proposalPrice - proposalReserved);
+
+    let otherSubmitted = [];
+    if (job) {
+      const jobBudget = normalizeBudget(job.budget);
+      if (jobBudget > 0 && requiredExtra > jobBudget) {
+        return json({ message: "Proposal price cannot exceed client job budget" }, 400, req);
+      }
+
+      const alreadyAccepted = String(job.acceptedProposalId || "").trim();
+      if (alreadyAccepted && !sameId(alreadyAccepted, proposal._id)) {
+        return json({ message: "Another proposal has already been accepted for this job" }, 409, req);
+      }
+
+      otherSubmitted = await proposals
+        .find({
+          _id: { $ne: proposal._id },
+          jobId: proposal.jobId,
+          status: "submitted",
+        })
+        .toArray();
+    }
+
     const now = new Date();
 
     await proposals.updateOne(
@@ -107,7 +156,22 @@ export async function PATCH(req, { params }) {
     );
 
     if (jobQuery) {
-      await jobs.updateOne(jobQuery, { $set: { status: "closed", updatedAt: now } });
+      const sumOtherReserved = otherSubmitted.reduce((sum, item) => sum + getReservedAmount(item), 0);
+      const currentBudget = normalizeBudget(job?.budget);
+      const nextBudget = Math.max(0, currentBudget - requiredExtra + sumOtherReserved);
+      const originalBudget = normalizeBudget(job?.budgetOriginal || job?.budget);
+      await jobs.updateOne(jobQuery, {
+        $set: {
+          status: "closed",
+          budget: nextBudget,
+          budgetOriginal: originalBudget,
+          acceptedProposalId: proposal._id,
+          acceptedFreelancerId: proposal.freelancerId,
+          acceptedAmount: proposalPrice,
+          budgetReducedAt: now,
+          updatedAt: now,
+        },
+      });
     }
 
     const existingContract = await contracts.findOne({ proposalId: proposal._id });
@@ -120,7 +184,7 @@ export async function PATCH(req, { params }) {
         jobTitle: proposal.jobTitle || "Untitled Project",
         clientId: String(proposal.clientId || auth.user.id || "").trim(),
         freelancerId: proposal.freelancerId,
-        amount: Number(proposal.price || 0),
+        amount: proposalPrice,
         status: "active",
         startDate: now,
         createdAt: now,

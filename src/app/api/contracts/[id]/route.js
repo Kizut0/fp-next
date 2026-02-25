@@ -108,6 +108,23 @@ export async function PUT(req, { params }) {
       return json({ message: "Amount must be greater than 0" }, 400, req);
     }
 
+    const currentAmount = Number(contract.amount || 0);
+    const isProposalLinked = Boolean(contract.proposalId);
+    if (
+      isProposalLinked &&
+      payload.amount !== undefined &&
+      Number.isFinite(currentAmount) &&
+      amount !== currentAmount
+    ) {
+      return json(
+        {
+          message: "Contract amount is fixed from the accepted proposal and cannot be changed",
+        },
+        400,
+        req
+      );
+    }
+
     const nextStatus = payload.status !== undefined ? normalizeStatus(payload.status, contract.status) : contract.status;
 
     const startDate =

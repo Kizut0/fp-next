@@ -63,6 +63,11 @@ function resolveJobLookup(jobId) {
   return { $or: [{ _id: raw }, { jobId: raw }] };
 }
 
+function normalizeBudget(value) {
+  const budget = Number(value);
+  return Number.isFinite(budget) && budget > 0 ? budget : 0;
+}
+
 export async function OPTIONS(req) {
   return options(req);
 }
@@ -149,6 +154,11 @@ export async function POST(req) {
       return json({ message: "This job is not accepting proposals" }, 400, req);
     }
 
+    const jobBudget = normalizeBudget(job.budget);
+    if (jobBudget > 0 && price > jobBudget) {
+      return json({ message: "Proposal price cannot exceed client job budget" }, 400, req);
+    }
+
     const proposalJobId = job._id || job.jobId;
     const freelancerId = String(auth.user.id || "").trim();
 
@@ -163,6 +173,19 @@ export async function POST(req) {
     }
 
     const now = new Date();
+    const nextBudget = Math.max(0, jobBudget - price);
+    await jobs.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          budget: nextBudget,
+          budgetOriginal: normalizeBudget(job.budgetOriginal || job.budget),
+          updatedAt: now,
+        },
+        $inc: { proposalsCount: 1 },
+      }
+    );
+
     const clientId = String(job.clientId || job.userId || job.ownerId || job.createdBy || "").trim();
 
     const doc = {
@@ -171,6 +194,8 @@ export async function POST(req) {
       clientId,
       freelancerId,
       price,
+      reservedAmount: price,
+      reservedAt: now,
       message,
       status: "submitted",
       createdAt: now,
@@ -178,11 +203,6 @@ export async function POST(req) {
     };
 
     const result = await proposals.insertOne(doc);
-
-    await jobs.updateOne(
-      { _id: job._id },
-      { $inc: { proposalsCount: 1 }, $set: { updatedAt: now } }
-    );
 
     return json(cleanDoc({ ...doc, _id: result.insertedId }), 201, req);
   } catch (error) {

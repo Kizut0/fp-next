@@ -12,33 +12,47 @@ export async function POST(req) {
     try {
         const { email, password } = await req.json();
 
-        if (!email || !password) {
-            return json({ message: "Email and password are required" }, 400);
+        const normalizedEmail = String(email || "").toLowerCase().trim();
+        const normalizedPassword = String(password || "");
+
+        if (!normalizedEmail && !normalizedPassword) {
+            return json({ message: "Email and password are required", field: "email_password" }, 400);
+        }
+
+        if (!normalizedEmail) {
+            return json({ message: "Email is required", field: "email" }, 400);
+        }
+
+        if (!normalizedPassword) {
+            return json({ message: "Password is required", field: "password" }, 400);
         }
 
         const db = await getDb();
         const users = db.collection(process.env.USER_COLLECTION || "userData");
-        const normalizedEmail = String(email).toLowerCase().trim();
 
         const user = await users.findOne({ email: normalizedEmail });
         if (!user) {
-            return json({ message: "Invalid credentials" }, 401);
+            return json({ message: "Email is incorrect", field: "email" }, 401);
         }
 
         let ok = false;
         if (user.passwordHash) {
-            ok = await comparePassword(password, user.passwordHash);
+            ok = await comparePassword(normalizedPassword, user.passwordHash);
         } else if (user.password) {
             // Backward compatibility for legacy plaintext records.
-            ok = String(user.password) === String(password);
+            ok = String(user.password) === normalizedPassword;
         }
 
         if (!ok) {
-            return json({ message: "Invalid credentials" }, 401);
+            return json({ message: "Password is incorrect", field: "password" }, 401);
         }
 
-        if (user.status === "blocked") {
+        const status = String(user.status || "active").trim().toLowerCase();
+        if (status === "blocked") {
             return json({ message: "Account is blocked" }, 403);
+        }
+        if (["deactive", "deactivated", "inactive"].includes(status)) {
+            return json({ message: "Account is deactivated" }, 403);
         }
 
         const token = signToken({

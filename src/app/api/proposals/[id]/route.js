@@ -43,6 +43,37 @@ function canEditProposal(authUser, proposal) {
   return String(proposal.freelancerId || "").trim() === userId;
 }
 
+async function decrementJobProposalCount(jobs, proposal, now = new Date()) {
+  if (!proposal?.jobId) return;
+
+  const rawJobId = String(proposal.jobId || "").trim();
+  if (!rawJobId) return;
+
+  const objectJobId = toObjectId(rawJobId);
+  const jobLookup = objectJobId
+    ? { $or: [{ _id: objectJobId }, { _id: rawJobId }, { jobId: rawJobId }] }
+    : { $or: [{ _id: rawJobId }, { jobId: rawJobId }] };
+
+  const job = await jobs.findOne(jobLookup);
+  if (!job) return;
+
+  const current = Number(job.proposalsCount || 0);
+  const next = current > 0 ? current - 1 : 0;
+  await jobs.updateOne({ _id: job._id }, { $set: { proposalsCount: next, updatedAt: now } });
+}
+
+function resolveUserQuery(rawUserId) {
+  const userId = String(rawUserId || "").trim();
+  if (!userId) return null;
+
+  const objectId = toObjectId(userId);
+  if (objectId) {
+    return { $or: [{ _id: objectId }, { _id: userId }, { userId }] };
+  }
+
+  return { $or: [{ _id: userId }, { userId }] };
+}
+
 async function getParamId(params) {
   const resolved = await params;
   return String(resolved?.id || "").trim();
@@ -141,32 +172,71 @@ export async function DELETE(req, { params }) {
     const db = await getDb();
     const proposals = db.collection("proposals");
     const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
+    const users = db.collection(process.env.USER_COLLECTION || "userData");
 
     const proposal = await proposals.findOne(query);
     if (!proposal) return json({ message: "Proposal not found" }, 404, req);
 
-    if (!canAccessProposal(auth.user, proposal)) {
+    const authUserId = String(auth.user.id || "").trim();
+    const proposalFreelancerId = String(proposal.freelancerId || "").trim();
+    const isAdmin = auth.user.role === "Admin";
+    const isFreelancerOwner =
+      auth.user.role === "Freelancer" &&
+      Boolean(authUserId) &&
+      authUserId === proposalFreelancerId;
+
+    if (!isAdmin && !isFreelancerOwner) {
       return json({ message: "Forbidden" }, 403, req);
     }
 
-    await proposals.deleteOne({ _id: proposal._id });
+    if (isAdmin) {
+      await proposals.deleteOne({ _id: proposal._id });
+      await decrementJobProposalCount(jobs, proposal, new Date());
+      return json({ ok: true, deleted: true }, 200, req);
+    }
 
-    if (proposal.jobId) {
-      const rawJobId = String(proposal.jobId || "").trim();
-      const objectJobId = toObjectId(rawJobId);
-      const jobLookup = objectJobId
-        ? { $or: [{ _id: objectJobId }, { _id: rawJobId }, { jobId: rawJobId }] }
-        : { $or: [{ _id: rawJobId }, { jobId: rawJobId }] };
+    const currentStatus = String(proposal.status || "submitted").trim().toLowerCase();
+    if (currentStatus !== "submitted") {
+      return json({ message: "Only submitted proposals can be withdrawn" }, 400, req);
+    }
 
-      const job = await jobs.findOne(jobLookup);
-      if (job) {
-        const current = Number(job.proposalsCount || 0);
-        const next = current > 0 ? current - 1 : 0;
-        await jobs.updateOne({ _id: job._id }, { $set: { proposalsCount: next, updatedAt: new Date() } });
+    const now = new Date();
+    await proposals.updateOne(
+      { _id: proposal._id },
+      { $set: { status: "withdrawn", updatedAt: now } }
+    );
+    await decrementJobProposalCount(jobs, proposal, now);
+
+    let withdrawCount = 0;
+    let deactivated = false;
+
+    const userQuery = resolveUserQuery(proposalFreelancerId);
+    if (userQuery) {
+      await users.updateOne(userQuery, { $inc: { withdrawCount: 1 }, $set: { updatedAt: now } });
+
+      const user = await users.findOne(userQuery, {
+        projection: { withdrawCount: 1, status: 1 },
+      });
+
+      withdrawCount = Number(user?.withdrawCount || 0);
+      const status = String(user?.status || "active").trim().toLowerCase();
+
+      if (withdrawCount >= 10 && status !== "deactive") {
+        await users.updateOne(userQuery, { $set: { status: "deactive", updatedAt: now } });
+        deactivated = true;
       }
     }
 
-    return json({ ok: true }, 200, req);
+    return json(
+      {
+        ok: true,
+        withdrawn: true,
+        withdrawCount,
+        deactivated,
+      },
+      200,
+      req
+    );
   } catch (error) {
     return json({ message: "Failed to delete proposal", error: error.message }, 500, req);
   }

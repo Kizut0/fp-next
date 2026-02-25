@@ -44,6 +44,7 @@ export async function POST(req) {
             passwordHash,
             role: safeRole,
             status: "active",
+            withdrawCount: 0,
             createdAt: now,
             updatedAt: now,
         });

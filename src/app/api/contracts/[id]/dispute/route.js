@@ -1,5 +1,15 @@
 import { getDb } from "../../../../../lib/mongodb";
 import { cleanDoc, json, options, requireAuth, toObjectId } from "../../../../../lib/api";
+import {
+  buildDisputeOpenState,
+  buildDisputeResolvedState,
+  buildPaymentStatusHistoryEntry,
+  canTransitionPaymentStatus,
+  ensurePaymentIndexes,
+  hasOpenDispute,
+  isActivePaymentStatus,
+  normalizePaymentStatus,
+} from "../../../../../lib/payments";
 
 export const dynamic = "force-dynamic";
 
@@ -46,9 +56,30 @@ function canClientOpenDispute(authUser, contract) {
 }
 
 function resolvePaymentQuery(contract) {
-  const canonicalId = normalizeId(contract._id || contract.contractId);
-  const alternateId = normalizeId(contract.contractId);
-  const ids = [canonicalId, alternateId].filter(Boolean);
+  const ids = [];
+  const seen = new Set();
+  const contractIds = [contract?._id, contract?.contractId];
+
+  for (const value of contractIds) {
+    const normalized = normalizeId(value);
+    if (!normalized) continue;
+
+    const stringKey = `s:${normalized}`;
+    if (!seen.has(stringKey)) {
+      seen.add(stringKey);
+      ids.push(normalized);
+    }
+
+    const objectId = toObjectId(normalized);
+    if (!objectId) continue;
+
+    const objectIdKey = `o:${String(objectId)}`;
+    if (!seen.has(objectIdKey)) {
+      seen.add(objectIdKey);
+      ids.push(objectId);
+    }
+  }
+
   if (!ids.length) return null;
   return { contractId: { $in: ids } };
 }
@@ -57,25 +88,12 @@ function canOpenByCompletionOrPayment(contract, payment) {
   const completionStatus = normalizeId(contract?.completionRequest?.status).toLowerCase();
   if (["pending", "accepted"].includes(completionStatus)) return true;
 
-  const paymentStatus = normalizeId(payment?.status).toLowerCase();
-  return ["pending", "hold"].includes(paymentStatus);
+  const paymentStatus = normalizePaymentStatus(payment?.status, "");
+  return ["reserved", "in_review", "released", "disputed"].includes(paymentStatus);
 }
 
 function isResolvableDispute(dispute) {
   return normalizeId(dispute?.status).toLowerCase() === "open";
-}
-
-function buildDisputeState(actionBy, reason, now) {
-  return {
-    status: "open",
-    reason,
-    openedAt: now,
-    openedBy: actionBy,
-    resolvedAt: null,
-    resolvedBy: "",
-    resolution: "",
-    resolutionNote: "",
-  };
 }
 
 async function getParamId(params) {
@@ -105,6 +123,7 @@ export async function PATCH(req, { params }) {
     const db = await getDb();
     const contracts = db.collection("contracts");
     const payments = db.collection("payments");
+    await ensurePaymentIndexes(payments);
 
     const contract = await contracts.findOne(query);
     if (!contract) return json({ message: "Contract not found" }, 404, req);
@@ -127,30 +146,59 @@ export async function PATCH(req, { params }) {
       if (isResolvableDispute(contract.dispute)) {
         return json({ message: "This contract already has an open dispute" }, 409, req);
       }
-
-      if (!canOpenByCompletionOrPayment(contract, payment)) {
-        return json({ message: "Dispute can only be opened after submission or during payment hold/pending" }, 400, req);
+      if (hasOpenDispute(payment)) {
+        return json({ message: "This payment already has an open dispute" }, 409, req);
       }
 
-      if (normalizeId(payment?.status).toLowerCase() === "paid") {
-        return json({ message: "Cannot open dispute after payment release" }, 409, req);
+      if (!canOpenByCompletionOrPayment(contract, payment)) {
+        return json({ message: "Dispute can only be opened after submission or during reserved/in-review/released payment states" }, 400, req);
+      }
+
+      const paymentStatus = normalizePaymentStatus(payment?.status, "");
+      if (["withdrawn", "refunded", "failed"].includes(paymentStatus)) {
+        return json({ message: "Cannot open dispute for withdrawn/refunded/failed payment" }, 409, req);
       }
 
       const update = {
-        dispute: buildDisputeState(actorId, reason, now),
+        dispute: buildDisputeOpenState({ reason, openedBy: actorId, now }),
         updatedAt: now,
       };
 
       await contracts.updateOne({ _id: contract._id }, { $set: update });
 
       if (payment?._id) {
+        if (!canTransitionPaymentStatus(paymentStatus, "disputed")) {
+          return json(
+            { message: `Invalid payment status transition: ${paymentStatus} -> disputed` },
+            409,
+            req
+          );
+        }
+
         await payments.updateOne(
           { _id: payment._id },
           {
             $set: {
-              status: "hold",
-              note: payment.note || "Payment put on hold due to dispute",
+              status: "disputed",
+              isActive: isActivePaymentStatus("disputed"),
+              note: payment.note || "Payment marked disputed by client",
+              dispute: buildDisputeOpenState({ reason, openedBy: actorId, now }),
               updatedAt: now,
+            },
+            $push: {
+              statusHistory: {
+                $each: [
+                  buildPaymentStatusHistoryEntry({
+                    action: "contract_dispute_open",
+                    fromStatus: paymentStatus,
+                    toStatus: "disputed",
+                    reason,
+                    actorId,
+                    at: now,
+                  }),
+                ],
+                $slice: -120,
+              },
             },
           }
         );
@@ -178,16 +226,48 @@ export async function PATCH(req, { params }) {
       return json({ message: "Cannot resolve dispute without a payment record" }, 404, req);
     }
 
-    const nextPaymentStatus = resolution === "release" ? "paid" : "refunded";
+    const currentPaymentStatus = normalizePaymentStatus(payment.status, "");
+    const nextPaymentStatus = resolution === "release" ? "released" : "refunded";
+    if (!canTransitionPaymentStatus(currentPaymentStatus, nextPaymentStatus)) {
+      return json(
+        { message: `Invalid payment status transition: ${currentPaymentStatus} -> ${nextPaymentStatus}` },
+        409,
+        req
+      );
+    }
+
     await payments.updateOne(
       { _id: payment._id },
       {
         $set: {
           status: nextPaymentStatus,
+          isActive: isActivePaymentStatus(nextPaymentStatus),
           note:
             resolutionNote ||
             (resolution === "release" ? "Released by admin after dispute resolution" : "Refunded by admin after dispute resolution"),
+          dispute: buildDisputeResolvedState({
+            previous: payment.dispute,
+            resolution,
+            resolutionNote,
+            resolvedBy: actorId,
+            now,
+          }),
           updatedAt: now,
+        },
+        $push: {
+          statusHistory: {
+            $each: [
+              buildPaymentStatusHistoryEntry({
+                action: "contract_dispute_resolve",
+                fromStatus: currentPaymentStatus,
+                toStatus: nextPaymentStatus,
+                reason: resolutionNote || resolution,
+                actorId,
+                at: now,
+              }),
+            ],
+            $slice: -120,
+          },
         },
       }
     );

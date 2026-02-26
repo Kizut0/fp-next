@@ -1,5 +1,11 @@
 import { getDb } from "../../../lib/mongodb";
 import { cleanDoc, cleanDocs, json, options, requireAuth, toObjectId } from "../../../lib/api";
+import {
+  buildContractCompletionRequest,
+  buildMilestoneSummary,
+  ensureContractMilestones,
+  normalizeMilestonesForContract,
+} from "../../../lib/contractMilestones";
 
 export const dynamic = "force-dynamic";
 
@@ -72,6 +78,19 @@ function getReservedAmount(proposal = {}) {
   return Number.isFinite(price) && price > 0 ? price : 0;
 }
 
+function normalizeContractForResponse(contract) {
+  const milestones = ensureContractMilestones(contract);
+  return {
+    ...contract,
+    milestones,
+    milestoneSummary: buildMilestoneSummary(milestones),
+    completionRequest: buildContractCompletionRequest(
+      milestones,
+      contract?.completionRequest?.milestoneKey
+    ),
+  };
+}
+
 export async function OPTIONS(req) {
   return options(req);
 }
@@ -98,7 +117,7 @@ export async function GET(req) {
 
     const db = await getDb();
     const items = await db.collection("contracts").find(query).sort({ createdAt: -1 }).toArray();
-    return json(cleanDocs(items), 200, req);
+    return json(cleanDocs(items.map(normalizeContractForResponse)), 200, req);
   } catch (error) {
     return json({ message: "Failed to load contracts", error: error.message }, 500, req);
   }
@@ -137,7 +156,14 @@ export async function POST(req) {
 
       const existing = await contracts.findOne({ proposalId: proposal._id });
       if (existing) {
-        return json({ message: "Contract already exists for this proposal", contract: cleanDoc(existing) }, 409, req);
+        return json(
+          {
+            message: "Contract already exists for this proposal",
+            contract: cleanDoc(normalizeContractForResponse(existing)),
+          },
+          409,
+          req
+        );
       }
 
       const proposalAmount = Number(proposal.price || 0);
@@ -146,6 +172,18 @@ export async function POST(req) {
       }
       const proposalReserved = getReservedAmount(proposal);
       const requiredExtra = Math.max(0, proposalAmount - proposalReserved);
+      const milestoneResult = normalizeMilestonesForContract(
+        payload.milestones || proposal.milestones,
+        {
+          totalAmount: proposalAmount,
+          strictTotal: true,
+          legacyStatus: "active",
+          defaultTitle: proposal.jobTitle || "Project Delivery",
+        }
+      );
+      if (milestoneResult.error) {
+        return json({ message: milestoneResult.error }, 400, req);
+      }
 
       const now = new Date();
       const jobQuery = resolveJobQuery(proposal.jobId);
@@ -196,7 +234,10 @@ export async function POST(req) {
         jobTitle: proposal.jobTitle || "Untitled Project",
         clientId: String(proposal.clientId || auth.user.id || "").trim(),
         freelancerId: String(proposal.freelancerId || "").trim(),
-        amount: proposalAmount,
+        amount: milestoneResult.totalAmount,
+        milestones: milestoneResult.milestones,
+        milestoneSummary: buildMilestoneSummary(milestoneResult.milestones),
+        completionRequest: buildContractCompletionRequest(milestoneResult.milestones),
         status: "active",
         startDate: now,
         createdAt: now,
@@ -214,7 +255,7 @@ export async function POST(req) {
         { $set: { status: "rejected", updatedAt: now } }
       );
 
-      return json(cleanDoc({ ...doc, _id: inserted.insertedId }), 201, req);
+      return json(cleanDoc(normalizeContractForResponse({ ...doc, _id: inserted.insertedId })), 201, req);
     }
 
     const jobId = String(payload.jobId || "").trim();
@@ -238,6 +279,17 @@ export async function POST(req) {
       return json({ message: "clientId is required" }, 400, req);
     }
 
+    const nextStatus = normalizeStatus(payload.status, "active");
+    const milestoneResult = normalizeMilestonesForContract(payload.milestones, {
+      totalAmount: amount,
+      strictTotal: true,
+      legacyStatus: nextStatus,
+      defaultTitle: String(payload.jobTitle || "Project Delivery").trim(),
+    });
+    if (milestoneResult.error) {
+      return json({ message: milestoneResult.error }, 400, req);
+    }
+
     const now = new Date();
     const doc = {
       proposalId: null,
@@ -245,8 +297,11 @@ export async function POST(req) {
       jobTitle: String(payload.jobTitle || "Untitled Project").trim(),
       clientId: ownerId,
       freelancerId,
-      amount,
-      status: normalizeStatus(payload.status, "active"),
+      amount: milestoneResult.totalAmount,
+      milestones: milestoneResult.milestones,
+      milestoneSummary: buildMilestoneSummary(milestoneResult.milestones),
+      completionRequest: buildContractCompletionRequest(milestoneResult.milestones),
+      status: nextStatus,
       startDate,
       ...(endDate ? { endDate } : {}),
       createdAt: now,
@@ -268,7 +323,7 @@ export async function POST(req) {
       );
     }
 
-    return json(cleanDoc({ ...doc, _id: inserted.insertedId }), 201, req);
+    return json(cleanDoc(normalizeContractForResponse({ ...doc, _id: inserted.insertedId })), 201, req);
   } catch (error) {
     return json({ message: "Failed to create contract", error: error.message }, 500, req);
   }

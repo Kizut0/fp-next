@@ -1,5 +1,11 @@
 import { getDb } from "../../../../../lib/mongodb";
 import { cleanDoc, json, options, requireAuth, toObjectId } from "../../../../../lib/api";
+import {
+  buildContractCompletionRequest,
+  buildMilestoneSummary,
+  ensureContractMilestones,
+  normalizeMilestonesForContract,
+} from "../../../../../lib/contractMilestones";
 
 export const dynamic = "force-dynamic";
 
@@ -63,6 +69,19 @@ function getReservedAmount(proposal = {}) {
   return Number.isFinite(price) && price > 0 ? price : 0;
 }
 
+function normalizeContractForResponse(contract) {
+  const milestones = ensureContractMilestones(contract);
+  return {
+    ...contract,
+    milestones,
+    milestoneSummary: buildMilestoneSummary(milestones),
+    completionRequest: buildContractCompletionRequest(
+      milestones,
+      contract?.completionRequest?.milestoneKey
+    ),
+  };
+}
+
 async function getParamId(params) {
   const resolved = await params;
   return String(resolved?.id || "").trim();
@@ -79,6 +98,13 @@ export async function PATCH(req, { params }) {
   try {
     const rawId = await getParamId(params);
     if (!rawId) return json({ message: "Invalid proposal id" }, 400, req);
+
+    let payload = {};
+    try {
+      payload = await req.json();
+    } catch {
+      payload = {};
+    }
 
     const db = await getDb();
     const proposals = db.collection("proposals");
@@ -102,7 +128,7 @@ export async function PATCH(req, { params }) {
     const currentStatus = String(proposal.status || "submitted").toLowerCase();
     if (currentStatus === "accepted") {
       const existing = await contracts.findOne({ proposalId: proposal._id });
-      return json({ ok: true, contract: cleanDoc(existing) }, 200, req);
+      return json({ ok: true, contract: cleanDoc(normalizeContractForResponse(existing)) }, 200, req);
     }
 
     if (currentStatus !== "submitted") {
@@ -113,6 +139,19 @@ export async function PATCH(req, { params }) {
     const proposalPrice = Number(proposal.price || 0);
     if (!Number.isFinite(proposalPrice) || proposalPrice <= 0) {
       return json({ message: "Invalid proposal amount" }, 400, req);
+    }
+
+    const milestoneResult = normalizeMilestonesForContract(
+      payload.milestones || proposal.milestones,
+      {
+        totalAmount: proposalPrice,
+        strictTotal: true,
+        legacyStatus: "active",
+        defaultTitle: proposal.jobTitle || "Project Delivery",
+      }
+    );
+    if (milestoneResult.error) {
+      return json({ message: milestoneResult.error }, 400, req);
     }
 
     const proposalReserved = getReservedAmount(proposal);
@@ -184,7 +223,10 @@ export async function PATCH(req, { params }) {
         jobTitle: proposal.jobTitle || "Untitled Project",
         clientId: String(proposal.clientId || auth.user.id || "").trim(),
         freelancerId: proposal.freelancerId,
-        amount: proposalPrice,
+        amount: milestoneResult.totalAmount,
+        milestones: milestoneResult.milestones,
+        milestoneSummary: buildMilestoneSummary(milestoneResult.milestones),
+        completionRequest: buildContractCompletionRequest(milestoneResult.milestones),
         status: "active",
         startDate: now,
         createdAt: now,
@@ -195,7 +237,7 @@ export async function PATCH(req, { params }) {
       contract = { ...contractDoc, _id: inserted.insertedId };
     }
 
-    return json({ ok: true, contract: cleanDoc(contract) }, 200, req);
+    return json({ ok: true, contract: cleanDoc(normalizeContractForResponse(contract)) }, 200, req);
   } catch (error) {
     return json({ message: "Failed to accept proposal", error: error.message }, 500, req);
   }

@@ -1,5 +1,12 @@
 import { getDb } from "../../../../lib/mongodb";
 import { cleanDoc, json, options, requireAuth, toObjectId } from "../../../../lib/api";
+import {
+  areAllMilestonesReleased,
+  buildContractCompletionRequest,
+  buildMilestoneSummary,
+  ensureContractMilestones,
+  normalizeMilestonesForContract,
+} from "../../../../lib/contractMilestones";
 
 export const dynamic = "force-dynamic";
 
@@ -55,6 +62,19 @@ function canMutateContract(authUser, contract) {
     .filter(Boolean);
 
   return clientIds.includes(userId);
+}
+
+function normalizeContractForResponse(contract) {
+  const milestones = ensureContractMilestones(contract);
+  return {
+    ...contract,
+    milestones,
+    milestoneSummary: buildMilestoneSummary(milestones),
+    completionRequest: buildContractCompletionRequest(
+      milestones,
+      contract?.completionRequest?.milestoneKey
+    ),
+  };
 }
 
 function normalizeJobIdVariants(contract) {
@@ -117,7 +137,7 @@ export async function GET(req, { params }) {
       return json({ message: "Forbidden" }, 403, req);
     }
 
-    return json(cleanDoc(contract), 200, req);
+    return json(cleanDoc(normalizeContractForResponse(contract)), 200, req);
   } catch (error) {
     return json({ message: "Failed to load contract", error: error.message }, 500, req);
   }
@@ -143,7 +163,7 @@ export async function PUT(req, { params }) {
 
     const payload = await req.json();
 
-    const amount = payload.amount !== undefined ? Number(payload.amount) : Number(contract.amount || 0);
+    let amount = payload.amount !== undefined ? Number(payload.amount) : Number(contract.amount || 0);
     if (!Number.isFinite(amount) || amount <= 0) {
       return json({ message: "Amount must be greater than 0" }, 400, req);
     }
@@ -166,6 +186,48 @@ export async function PUT(req, { params }) {
     }
 
     const nextStatus = payload.status !== undefined ? normalizeStatus(payload.status, contract.status) : contract.status;
+    const currentMilestones = ensureContractMilestones(contract);
+    let nextMilestones = currentMilestones;
+
+    if (payload.milestones !== undefined) {
+      const normalizedMilestones = normalizeMilestonesForContract(payload.milestones, {
+        totalAmount: amount,
+        strictTotal: true,
+        legacyStatus: nextStatus,
+        defaultTitle:
+          payload.jobTitle !== undefined
+            ? String(payload.jobTitle || "Project Delivery").trim()
+            : String(contract.jobTitle || "Project Delivery").trim(),
+      });
+
+      if (normalizedMilestones.error) {
+        return json({ message: normalizedMilestones.error }, 400, req);
+      }
+
+      nextMilestones = normalizedMilestones.milestones;
+      amount = normalizedMilestones.totalAmount;
+    } else if (payload.amount !== undefined) {
+      if (currentMilestones.length > 1) {
+        return json(
+          { message: "For multi-milestone contracts, update milestones when changing amount" },
+          400,
+          req
+        );
+      }
+
+      nextMilestones = currentMilestones.map((item, index) => {
+        if (index !== 0) return item;
+        return { ...item, amount };
+      });
+    }
+
+    if (nextStatus === "completed" && !areAllMilestonesReleased(nextMilestones)) {
+      return json(
+        { message: "All milestones must be released before marking contract completed" },
+        400,
+        req
+      );
+    }
 
     const startDate =
       payload.startDate !== undefined
@@ -180,6 +242,9 @@ export async function PUT(req, { params }) {
     const update = {
       amount,
       status: nextStatus,
+      milestones: nextMilestones,
+      milestoneSummary: buildMilestoneSummary(nextMilestones),
+      completionRequest: buildContractCompletionRequest(nextMilestones),
       jobTitle:
         payload.jobTitle !== undefined
           ? String(payload.jobTitle || "Untitled Project").trim()
@@ -197,7 +262,7 @@ export async function PUT(req, { params }) {
     await syncJobStatusForContract(db, contract, nextStatus);
 
     const updated = await contracts.findOne({ _id: contract._id });
-    return json(cleanDoc(updated), 200, req);
+    return json(cleanDoc(normalizeContractForResponse(updated)), 200, req);
   } catch (error) {
     return json({ message: "Failed to update contract", error: error.message }, 500, req);
   }

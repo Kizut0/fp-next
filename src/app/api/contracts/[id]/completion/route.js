@@ -175,6 +175,59 @@ export async function PATCH(req, { params }) {
         }
       );
       await syncJobStatusForContract(db, contract, "in_progress", now);
+
+      const payments = db.collection("payments");
+      const canonicalId = normalizeId(contract._id || contract.contractId);
+      const altId = normalizeId(contract.contractId);
+      const paymentQuery = {
+        $or: [{ contractId: canonicalId }, ...(altId ? [{ contractId: altId }] : [])],
+      };
+      const existingPayment = await payments.findOne(paymentQuery, { sort: { updatedAt: -1, createdAt: -1 } });
+
+      const clientId = resolveContractClientId(contract);
+      const freelancerId = normalizeId(contract.freelancerId);
+      const amount = Number(contract.amount || 0);
+
+      if (!existingPayment) {
+        if (clientId && freelancerId && Number.isFinite(amount) && amount > 0) {
+          await payments.insertOne({
+            contractId: canonicalId || altId,
+            clientId,
+            freelancerId,
+            amount,
+            status: "hold",
+            note: "Payment held after freelancer submitted work",
+            dispute: {
+              status: "none",
+              reason: "",
+              openedAt: null,
+              openedBy: "",
+              resolution: "",
+              resolutionNote: "",
+              resolvedAt: null,
+              resolvedBy: "",
+            },
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+      } else {
+        const paymentStatus = String(existingPayment.status || "").trim().toLowerCase();
+        const disputeStatus = String(existingPayment.dispute?.status || "").trim().toLowerCase();
+        const hasOpenDispute = disputeStatus === "open" || paymentStatus === "disputed";
+
+        if (!hasOpenDispute && !["paid", "refunded"].includes(paymentStatus)) {
+          await payments.updateOne(
+            { _id: existingPayment._id },
+            {
+              $set: {
+                status: "hold",
+                updatedAt: now,
+              },
+            }
+          );
+        }
+      }
     }
 
     if (action === "accept") {
@@ -227,9 +280,30 @@ export async function PATCH(req, { params }) {
             amount,
             status: "pending",
             note: "Auto-created after client accepted completed work",
+            dispute: {
+              status: "none",
+              reason: "",
+              openedAt: null,
+              openedBy: "",
+              resolution: "",
+              resolutionNote: "",
+              resolvedAt: null,
+              resolvedBy: "",
+            },
             createdAt: now,
             updatedAt: now,
           });
+        }
+      } else {
+        const paymentStatus = String(existingPayment.status || "").trim().toLowerCase();
+        const disputeStatus = String(existingPayment.dispute?.status || "").trim().toLowerCase();
+        const hasOpenDispute = disputeStatus === "open" || paymentStatus === "disputed";
+
+        if (!hasOpenDispute && ["hold", "failed"].includes(paymentStatus)) {
+          await payments.updateOne(
+            { _id: existingPayment._id },
+            { $set: { status: "pending", updatedAt: now } }
+          );
         }
       }
     }

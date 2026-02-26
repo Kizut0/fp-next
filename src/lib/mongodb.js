@@ -1,6 +1,6 @@
 import { MongoClient } from "mongodb";
 
-const dbName = process.env.MONGODB_DB || "freelance_platform";
+const dbName = process.env.MONGODB_DB || "web_project_2";
 
 let cachedClient = global._mongoClient;
 let cachedDb = global._mongoDb;

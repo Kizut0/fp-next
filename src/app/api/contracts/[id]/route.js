@@ -4,10 +4,16 @@ import { cleanDoc, json, options, requireAuth, toObjectId } from "../../../../li
 export const dynamic = "force-dynamic";
 
 const STATUSES = ["active", "completed", "cancelled"];
+const NON_DELETABLE_CONTRACT_STATUSES = new Set(["accepted", "active", "completed"]);
 
 function normalizeStatus(value, fallback = "active") {
   const raw = String(value || fallback).trim().toLowerCase();
   return STATUSES.includes(raw) ? raw : fallback;
+}
+
+function isDeleteRestrictedContract(contract) {
+  const status = String(contract?.status || "").trim().toLowerCase();
+  return NON_DELETABLE_CONTRACT_STATUSES.has(status);
 }
 
 function toDateOrNull(value) {
@@ -213,6 +219,13 @@ export async function DELETE(req, { params }) {
 
     if (auth.user.role !== "Admin") {
       return json({ message: "Only admin can delete contracts" }, 403, req);
+    }
+    if (isDeleteRestrictedContract(contract)) {
+      return json(
+        { message: "Accepted, active, or completed contracts cannot be deleted. Use archive/cancel policy." },
+        409,
+        req
+      );
     }
 
     await contracts.deleteOne({ _id: contract._id });

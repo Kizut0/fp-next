@@ -10,6 +10,7 @@ const DEFAULTS = {
   duration: "1 to 3 months",
   locationType: "Remote",
 };
+const NON_DELETABLE_JOB_STATUSES = new Set(["accepted", "active", "completed"]);
 
 const JOB_STATUSES = ["draft", "open", "in_progress", "completed", "cancelled"];
 const JOB_STATUS_ALIASES = {
@@ -79,6 +80,13 @@ function normalizeStatus(value, fallback = "open") {
   if (JOB_STATUSES.includes(fallbackMapped)) return fallbackMapped;
 
   return "open";
+}
+
+function isDeleteRestrictedJob(job) {
+  const status = String(job?.status || "").trim().toLowerCase();
+  if (NON_DELETABLE_JOB_STATUSES.has(status)) return true;
+
+  return Boolean(String(job?.acceptedProposalId || "").trim());
 }
 
 function normalizeJob(job) {
@@ -379,6 +387,13 @@ export async function DELETE(req, { params }) {
 
     if (!isAdmin && !isOwnedByUser(existing, auth.user)) {
       return json({ message: "Forbidden" }, 403, req);
+    }
+    if (isDeleteRestrictedJob(existing)) {
+      return json(
+        { message: "Accepted, active, or completed jobs cannot be deleted. Use archive/cancel policy." },
+        409,
+        req
+      );
     }
 
     if (!isAdmin) {

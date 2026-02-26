@@ -21,6 +21,35 @@ function normalizeContractQuery(rawId) {
   return { $or: [{ _id: id }, { contractId: id }] };
 }
 
+function resolveUserQuery(rawUserId) {
+  const userId = normalizeId(rawUserId);
+  if (!userId) return null;
+
+  const objectId = toObjectId(userId);
+  if (objectId) {
+    return { $or: [{ _id: objectId }, { _id: userId }, { userId }] };
+  }
+
+  return { $or: [{ _id: userId }, { userId }] };
+}
+
+async function recordWithdrawAttempt(users, freelancerId, now) {
+  const userQuery = resolveUserQuery(freelancerId);
+  if (!userQuery) return;
+
+  await users.updateOne(userQuery, { $inc: { withdrawCount: 1 }, $set: { updatedAt: now } });
+
+  const user = await users.findOne(userQuery, {
+    projection: { withdrawCount: 1, status: 1 },
+  });
+
+  const withdrawCount = Number(user?.withdrawCount || 0);
+  const status = String(user?.status || "active").trim().toLowerCase();
+  if (withdrawCount >= 10 && status !== "deactive") {
+    await users.updateOne(userQuery, { $set: { status: "deactive", updatedAt: now } });
+  }
+}
+
 function normalizeStatus(value) {
   const status = String(value || "paid").trim().toLowerCase();
   return ALLOWED_STATUSES.has(status) ? status : "";
@@ -178,6 +207,7 @@ export async function POST(req) {
     }
 
     const db = await getDb();
+    const users = db.collection(process.env.USER_COLLECTION || "userData");
     const contract = await db.collection("contracts").findOne(contractQuery);
     if (!contract) {
       return json({ message: "Contract not found" }, 404, req);
@@ -241,6 +271,7 @@ export async function POST(req) {
     };
 
     const result = await db.collection("payments").insertOne(doc);
+    await recordWithdrawAttempt(users, freelancerId, now);
     return json(cleanDoc({ ...doc, _id: result.insertedId }), 201, req);
   } catch (error) {
     return json({ message: "Failed to create payment", error: error.message }, 500, req);

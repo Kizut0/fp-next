@@ -95,18 +95,6 @@ async function releaseReservedBudget(jobs, proposal, now = new Date()) {
   await jobs.updateOne({ _id: job._id }, { $inc: { budget: amount }, $set: { updatedAt: now } });
 }
 
-function resolveUserQuery(rawUserId) {
-  const userId = String(rawUserId || "").trim();
-  if (!userId) return null;
-
-  const objectId = toObjectId(userId);
-  if (objectId) {
-    return { $or: [{ _id: objectId }, { _id: userId }, { userId }] };
-  }
-
-  return { $or: [{ _id: userId }, { userId }] };
-}
-
 function resolveJobLookup(rawJobId) {
   const jobId = String(rawJobId || "").trim();
   if (!jobId) return null;
@@ -244,7 +232,6 @@ export async function DELETE(req, { params }) {
     const db = await getDb();
     const proposals = db.collection("proposals");
     const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
-    const users = db.collection(process.env.USER_COLLECTION || "userData");
 
     const proposal = await proposals.findOne(query);
     if (!proposal) return json({ message: "Proposal not found" }, 404, req);
@@ -283,32 +270,10 @@ export async function DELETE(req, { params }) {
     await decrementJobProposalCount(jobs, proposal, now);
     await releaseReservedBudget(jobs, proposal, now);
 
-    let withdrawCount = 0;
-    let deactivated = false;
-
-    const userQuery = resolveUserQuery(proposalFreelancerId);
-    if (userQuery) {
-      await users.updateOne(userQuery, { $inc: { withdrawCount: 1 }, $set: { updatedAt: now } });
-
-      const user = await users.findOne(userQuery, {
-        projection: { withdrawCount: 1, status: 1 },
-      });
-
-      withdrawCount = Number(user?.withdrawCount || 0);
-      const status = String(user?.status || "active").trim().toLowerCase();
-
-      if (withdrawCount >= 10 && status !== "deactive") {
-        await users.updateOne(userQuery, { $set: { status: "deactive", updatedAt: now } });
-        deactivated = true;
-      }
-    }
-
     return json(
       {
         ok: true,
         withdrawn: true,
-        withdrawCount,
-        deactivated,
       },
       200,
       req

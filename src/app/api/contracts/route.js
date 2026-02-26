@@ -176,7 +176,7 @@ export async function POST(req) {
             { _id: job._id },
             {
               $set: {
-                status: "closed",
+                status: "in_progress",
                 budget: nextBudget,
                 budgetOriginal: originalBudget,
                 acceptedProposalId: proposal._id,
@@ -254,6 +254,20 @@ export async function POST(req) {
     };
 
     const inserted = await contracts.insertOne(doc);
+    const manualJobQuery = resolveJobQuery(jobId);
+    if (manualJobQuery) {
+      await jobs.updateOne(
+        manualJobQuery,
+        {
+          $set: {
+            status: "in_progress",
+            acceptedFreelancerId: freelancerId,
+            updatedAt: now,
+          },
+        }
+      );
+    }
+
     return json(cleanDoc({ ...doc, _id: inserted.insertedId }), 201, req);
   } catch (error) {
     return json({ message: "Failed to create contract", error: error.message }, 500, req);

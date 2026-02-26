@@ -51,6 +51,40 @@ function canMutateContract(authUser, contract) {
   return clientIds.includes(userId);
 }
 
+function normalizeJobIdVariants(contract) {
+  const stringIds = Array.from(
+    new Set(
+      [contract?.jobId]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  const objectIds = stringIds.map((value) => toObjectId(value)).filter(Boolean);
+  return [...stringIds, ...objectIds];
+}
+
+function mapContractStatusToJobStatus(contractStatus) {
+  const status = normalizeStatus(contractStatus, "active");
+  if (status === "completed") return "completed";
+  if (status === "cancelled") return "cancelled";
+  return "in_progress";
+}
+
+async function syncJobStatusForContract(db, contract, contractStatus) {
+  const jobStatus = mapContractStatusToJobStatus(contractStatus);
+  const idVariants = normalizeJobIdVariants(contract);
+  if (!idVariants.length) return;
+
+  const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
+  await jobs.updateMany(
+    {
+      $or: [{ _id: { $in: idVariants } }, { jobId: { $in: idVariants } }],
+    },
+    { $set: { status: jobStatus, updatedAt: new Date() } }
+  );
+}
+
 async function getParamId(params) {
   const resolved = await params;
   return String(resolved?.id || "").trim();
@@ -154,6 +188,8 @@ export async function PUT(req, { params }) {
     }
 
     await contracts.updateOne({ _id: contract._id }, { $set: update });
+    await syncJobStatusForContract(db, contract, nextStatus);
+
     const updated = await contracts.findOne({ _id: contract._id });
     return json(cleanDoc(updated), 200, req);
   } catch (error) {

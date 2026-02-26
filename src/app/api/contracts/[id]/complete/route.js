@@ -54,6 +54,32 @@ function normalizeAttachment(input) {
   return { name, type, size, dataUrl };
 }
 
+function normalizeJobIdVariants(contract) {
+  const stringIds = Array.from(
+    new Set(
+      [contract?.jobId]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  const objectIds = stringIds.map((value) => toObjectId(value)).filter(Boolean);
+  return [...stringIds, ...objectIds];
+}
+
+async function syncCompletedJobStatus(db, contract, now) {
+  const idVariants = normalizeJobIdVariants(contract);
+  if (!idVariants.length) return;
+
+  const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
+  await jobs.updateMany(
+    {
+      $or: [{ _id: { $in: idVariants } }, { jobId: { $in: idVariants } }],
+    },
+    { $set: { status: "completed", updatedAt: now } }
+  );
+}
+
 async function getParamId(params) {
   const resolved = await params;
   return String(resolved?.id || "").trim();
@@ -118,6 +144,7 @@ export async function PATCH(req, { params }) {
       { _id: contract._id },
       { $set: update }
     );
+    await syncCompletedJobStatus(db, contract, now);
 
     const updated = await contracts.findOne({ _id: contract._id });
     return json(cleanDoc(updated), 200, req);

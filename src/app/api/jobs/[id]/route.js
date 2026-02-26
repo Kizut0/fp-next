@@ -11,6 +11,24 @@ const DEFAULTS = {
   locationType: "Remote",
 };
 
+const JOB_STATUSES = ["draft", "open", "in_progress", "completed", "cancelled"];
+const JOB_STATUS_ALIASES = {
+  closed: "cancelled",
+  "in-progress": "in_progress",
+  inprogress: "in_progress",
+};
+const CLIENT_EDITABLE_FIELDS = [
+  "title",
+  "description",
+  "budget",
+  "category",
+  "experienceLevel",
+  "projectType",
+  "duration",
+  "locationType",
+  "skills",
+];
+
 function toSkillsArray(value) {
   if (Array.isArray(value)) {
     return value.map((item) => String(item || "").trim()).filter(Boolean);
@@ -51,9 +69,15 @@ function deriveCreatedAt(clean) {
   return fromId ? fromId.getTimestamp() : null;
 }
 
-function normalizeStatus(value) {
-  const raw = String(value || "open").trim().toLowerCase();
-  if (raw === "closed") return "closed";
+function normalizeStatus(value, fallback = "open") {
+  const raw = String(value || "").trim().toLowerCase();
+  const mapped = JOB_STATUS_ALIASES[raw] || raw;
+  if (JOB_STATUSES.includes(mapped)) return mapped;
+
+  const fallbackRaw = String(fallback || "open").trim().toLowerCase();
+  const fallbackMapped = JOB_STATUS_ALIASES[fallbackRaw] || fallbackRaw;
+  if (JOB_STATUSES.includes(fallbackMapped)) return fallbackMapped;
+
   return "open";
 }
 
@@ -61,6 +85,8 @@ function normalizeJob(job) {
   const clean = cleanDoc(job) || {};
   const createdAt = deriveCreatedAt(clean);
   const updatedAt = toValidDate(clean.updatedAt, clean.modifiedAt, clean.lastUpdated, createdAt);
+  const status = normalizeStatus(clean.status, "open");
+  const isLocked = status !== "open" || Boolean(String(clean.acceptedProposalId || "").trim());
 
   return {
     ...clean,
@@ -74,7 +100,8 @@ function normalizeJob(job) {
     locationType: String(clean.locationType || DEFAULTS.locationType),
     skills: toSkillsArray(clean.skills),
     proposalsCount: Number(clean.proposalsCount || 0),
-    status: normalizeStatus(clean.status),
+    status,
+    isLocked,
     createdAt,
     updatedAt,
   };
@@ -106,6 +133,94 @@ function isOwnedByUser(job, user) {
   const userEmail = normalizeEmail(user?.email);
 
   return Boolean(userEmail && ownerEmails.includes(userEmail));
+}
+
+function normalizeComparableField(field, value) {
+  switch (field) {
+    case "title":
+    case "description":
+      return String(value || "").trim();
+    case "budget": {
+      const amount = Number(value);
+      return Number.isFinite(amount) ? amount : NaN;
+    }
+    case "category":
+      return String(value || DEFAULTS.category);
+    case "experienceLevel":
+      return String(value || DEFAULTS.experienceLevel);
+    case "projectType":
+      return String(value || DEFAULTS.projectType);
+    case "duration":
+      return String(value || DEFAULTS.duration);
+    case "locationType":
+      return String(value || DEFAULTS.locationType);
+    case "skills":
+      return toSkillsArray(value).join("|");
+    default:
+      return String(value || "").trim();
+  }
+}
+
+function hasClientDetailChanges(payload, existing) {
+  return CLIENT_EDITABLE_FIELDS.some((field) => {
+    if (!Object.prototype.hasOwnProperty.call(payload, field)) return false;
+
+    const next = normalizeComparableField(field, payload[field]);
+    const current = normalizeComparableField(field, existing?.[field]);
+
+    if (typeof next === "number" && Number.isNaN(next)) return true;
+    return next !== current;
+  });
+}
+
+function normalizeJobIdVariants(job) {
+  const stringIds = Array.from(
+    new Set(
+      [job?._id, job?.jobId]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  const objectIds = stringIds.map((value) => toObjectId(value)).filter(Boolean);
+  return [...stringIds, ...objectIds];
+}
+
+async function hasAcceptedProposalOrContract(db, job) {
+  if (String(job?.acceptedProposalId || "").trim()) {
+    return true;
+  }
+
+  const idVariants = normalizeJobIdVariants(job);
+  if (!idVariants.length) return false;
+
+  const proposals = db.collection("proposals");
+  const acceptedProposal = await proposals.findOne(
+    { jobId: { $in: idVariants }, status: "accepted" },
+    { projection: { _id: 1 } }
+  );
+  if (acceptedProposal) return true;
+
+  const contracts = db.collection("contracts");
+  const linkedContract = await contracts.findOne(
+    { jobId: { $in: idVariants } },
+    { projection: { _id: 1 } }
+  );
+  return Boolean(linkedContract);
+}
+
+function canClientTransitionStatus(currentStatus, nextStatus) {
+  if (currentStatus === nextStatus) return true;
+
+  if (currentStatus === "draft" && ["open", "cancelled"].includes(nextStatus)) {
+    return true;
+  }
+
+  if (currentStatus === "open" && nextStatus === "cancelled") {
+    return true;
+  }
+
+  return false;
 }
 
 async function resolveJobQuery(params) {
@@ -154,11 +269,46 @@ export async function PUT(req, { params }) {
     const existing = await jobs.findOne(query);
 
     if (!existing) return json({ message: "Job not found" }, 404, req);
-    if (auth.user.role !== "Admin" && !isOwnedByUser(existing, auth.user)) {
+    const isAdmin = auth.user.role === "Admin";
+
+    if (!isAdmin && !isOwnedByUser(existing, auth.user)) {
       return json({ message: "Forbidden" }, 403, req);
     }
 
     const payload = await req.json();
+    const currentStatus = normalizeStatus(existing.status, "open");
+    const nextStatus =
+      payload.status !== undefined ? normalizeStatus(payload.status, currentStatus) : currentStatus;
+
+    if (!isAdmin) {
+      const locked = await hasAcceptedProposalOrContract(db, existing);
+      const detailEditRequested = hasClientDetailChanges(payload, existing);
+
+      if (detailEditRequested && (currentStatus !== "open" || locked)) {
+        return json(
+          { message: "Only open jobs with no accepted proposal can be edited" },
+          409,
+          req
+        );
+      }
+
+      if (payload.status !== undefined) {
+        if (locked && nextStatus !== currentStatus) {
+          return json({ message: "This job is locked after proposal acceptance" }, 409, req);
+        }
+
+        if (!canClientTransitionStatus(currentStatus, nextStatus)) {
+          return json(
+            {
+              message:
+                "Invalid status transition. Allowed flow is draft -> open -> in_progress -> completed/cancelled",
+            },
+            400,
+            req
+          );
+        }
+      }
+    }
 
     const update = {
       title: payload.title !== undefined ? String(payload.title || "").trim() : existing.title,
@@ -167,8 +317,7 @@ export async function PUT(req, { params }) {
           ? String(payload.description || "").trim()
           : existing.description,
       budget: payload.budget !== undefined ? Number(payload.budget) : Number(existing.budget || 0),
-      status:
-        payload.status !== undefined ? normalizeStatus(payload.status) : normalizeStatus(existing.status),
+      status: nextStatus,
       category:
         payload.category !== undefined
           ? String(payload.category || DEFAULTS.category)
@@ -226,8 +375,22 @@ export async function DELETE(req, { params }) {
     const existing = await jobs.findOne(query);
 
     if (!existing) return json({ message: "Job not found" }, 404, req);
-    if (auth.user.role !== "Admin" && !isOwnedByUser(existing, auth.user)) {
+    const isAdmin = auth.user.role === "Admin";
+
+    if (!isAdmin && !isOwnedByUser(existing, auth.user)) {
       return json({ message: "Forbidden" }, 403, req);
+    }
+
+    if (!isAdmin) {
+      const status = normalizeStatus(existing.status, "open");
+      if (status !== "open") {
+        return json({ message: "Only open jobs can be deleted by client" }, 409, req);
+      }
+
+      const locked = await hasAcceptedProposalOrContract(db, existing);
+      if (locked) {
+        return json({ message: "Job is locked because a proposal has been accepted" }, 409, req);
+      }
     }
 
     await jobs.deleteOne({ _id: existing._id });

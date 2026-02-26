@@ -162,7 +162,7 @@ export async function PATCH(req, { params }) {
       const originalBudget = normalizeBudget(job?.budgetOriginal || job?.budget);
       await jobs.updateOne(jobQuery, {
         $set: {
-          status: "closed",
+          status: "in_progress",
           budget: nextBudget,
           budgetOriginal: originalBudget,
           acceptedProposalId: proposal._id,

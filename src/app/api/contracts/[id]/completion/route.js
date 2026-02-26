@@ -75,6 +75,35 @@ function canFreelancerSubmit(authUser, contract) {
   return authUser.role === "Freelancer" && userId === freelancerId;
 }
 
+function normalizeJobIdVariants(contract) {
+  const stringIds = Array.from(
+    new Set(
+      [contract?.jobId]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  const objectIds = stringIds.map((value) => toObjectId(value)).filter(Boolean);
+  return [...stringIds, ...objectIds];
+}
+
+async function syncJobStatusForContract(db, contract, status, now) {
+  const nextStatus = String(status || "").trim().toLowerCase();
+  if (!["in_progress", "completed", "cancelled"].includes(nextStatus)) return;
+
+  const idVariants = normalizeJobIdVariants(contract);
+  if (!idVariants.length) return;
+
+  const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
+  await jobs.updateMany(
+    {
+      $or: [{ _id: { $in: idVariants } }, { jobId: { $in: idVariants } }],
+    },
+    { $set: { status: nextStatus, updatedAt: now } }
+  );
+}
+
 async function getParamId(params) {
   const resolved = await params;
   return String(resolved?.id || "").trim();
@@ -145,6 +174,7 @@ export async function PATCH(req, { params }) {
           },
         }
       );
+      await syncJobStatusForContract(db, contract, "in_progress", now);
     }
 
     if (action === "accept") {
@@ -174,6 +204,7 @@ export async function PATCH(req, { params }) {
           },
         }
       );
+      await syncJobStatusForContract(db, contract, "completed", now);
 
       const payments = db.collection("payments");
       const canonicalId = normalizeId(contract._id || contract.contractId);
@@ -229,6 +260,7 @@ export async function PATCH(req, { params }) {
           },
         }
       );
+      await syncJobStatusForContract(db, contract, "in_progress", now);
     }
 
     const updated = await contracts.findOne({ _id: contract._id });

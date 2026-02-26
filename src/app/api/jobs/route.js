@@ -11,6 +11,13 @@ const DEFAULTS = {
   locationType: "Remote",
 };
 
+const JOB_STATUSES = ["draft", "open", "in_progress", "completed", "cancelled"];
+const JOB_STATUS_ALIASES = {
+  closed: "cancelled",
+  "in-progress": "in_progress",
+  inprogress: "in_progress",
+};
+
 function toSkillsArray(value) {
   if (Array.isArray(value)) {
     return value.map((item) => String(item || "").trim()).filter(Boolean);
@@ -84,16 +91,32 @@ function buildOwnerMatch(user) {
   return ownerMatch;
 }
 
-function normalizeStatus(value) {
-  const raw = String(value || "open").trim().toLowerCase();
-  if (raw === "closed") return "closed";
+function normalizeStatus(value, fallback = "open") {
+  const raw = String(value || "").trim().toLowerCase();
+  const mapped = JOB_STATUS_ALIASES[raw] || raw;
+  if (JOB_STATUSES.includes(mapped)) return mapped;
+
+  const fallbackRaw = String(fallback || "open").trim().toLowerCase();
+  const fallbackMapped = JOB_STATUS_ALIASES[fallbackRaw] || fallbackRaw;
+  if (JOB_STATUSES.includes(fallbackMapped)) return fallbackMapped;
+
   return "open";
+}
+
+function normalizeStatusFilter(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || raw === "all") return "";
+
+  const mapped = JOB_STATUS_ALIASES[raw] || raw;
+  return JOB_STATUSES.includes(mapped) ? mapped : "";
 }
 
 function normalizeJob(job) {
   const clean = cleanDoc(job) || {};
   const createdAt = deriveCreatedAt(clean);
   const updatedAt = toValidDate(clean.updatedAt, clean.modifiedAt, clean.lastUpdated, createdAt);
+  const status = normalizeStatus(clean.status, "open");
+  const isLocked = status !== "open" || Boolean(String(clean.acceptedProposalId || "").trim());
 
   return {
     ...clean,
@@ -107,7 +130,8 @@ function normalizeJob(job) {
     locationType: String(clean.locationType || DEFAULTS.locationType),
     skills: toSkillsArray(clean.skills),
     proposalsCount: Number(clean.proposalsCount || 0),
-    status: normalizeStatus(clean.status),
+    status,
+    isLocked,
     createdAt,
     updatedAt,
   };
@@ -120,7 +144,7 @@ function escapeRegex(input) {
 function buildQuery(searchParams) {
   const query = {};
 
-  const status = String(searchParams.get("status") || "").trim();
+  const status = normalizeStatusFilter(searchParams.get("status"));
   const category = String(searchParams.get("category") || "").trim();
   const experienceLevel = String(searchParams.get("experienceLevel") || "").trim();
   const projectType = String(searchParams.get("projectType") || "").trim();
@@ -129,7 +153,7 @@ function buildQuery(searchParams) {
   const maxBudget = parseNumber(searchParams.get("maxBudget"));
   const q = String(searchParams.get("q") || "").trim();
 
-  if (status && status !== "all") query.status = status;
+  if (status) query.status = status;
   if (category && category !== "all") query.category = category;
   if (experienceLevel && experienceLevel !== "all") query.experienceLevel = experienceLevel;
   if (projectType && projectType !== "all") query.projectType = projectType;
@@ -229,6 +253,8 @@ export async function POST(req) {
   try {
     const payload = await req.json();
     const now = new Date();
+    const requestedStatus = normalizeStatus(payload.status, "draft");
+    const isAdmin = auth.user.role === "Admin";
 
     const title = String(payload.title || "").trim();
     const description = String(payload.description || "").trim();
@@ -244,6 +270,10 @@ export async function POST(req) {
 
     if (!Number.isFinite(budget) || budget <= 0) {
       return json({ message: "Budget must be greater than 0" }, 400, req);
+    }
+
+    if (!isAdmin && !["draft", "open"].includes(requestedStatus)) {
+      return json({ message: "Client can create jobs only in draft or open status" }, 400, req);
     }
 
     const ownerId = String(auth.user.id || "").trim();
@@ -281,7 +311,7 @@ export async function POST(req) {
       skills: toSkillsArray(payload.skills),
       proposalsCount: 0,
       ...ownerFields,
-      status: normalizeStatus(payload.status),
+      status: requestedStatus,
       createdAt: now,
       postedAt: now,
       updatedAt: now,

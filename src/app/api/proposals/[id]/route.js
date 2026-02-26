@@ -10,6 +10,19 @@ function normalizeStatus(value) {
   return ALLOWED_STATUSES.includes(raw) ? raw : "submitted";
 }
 
+function normalizeBudget(value) {
+  const budget = Number(value);
+  return Number.isFinite(budget) && budget > 0 ? budget : 0;
+}
+
+function getReservedAmount(proposal = {}) {
+  const reserved = Number(proposal.reservedAmount);
+  if (Number.isFinite(reserved) && reserved > 0) return reserved;
+
+  const price = Number(proposal.price);
+  return Number.isFinite(price) && price > 0 ? price : 0;
+}
+
 function normalizeQueryId(value) {
   const raw = String(value || "").trim();
   if (!raw) return null;
@@ -62,6 +75,26 @@ async function decrementJobProposalCount(jobs, proposal, now = new Date()) {
   await jobs.updateOne({ _id: job._id }, { $set: { proposalsCount: next, updatedAt: now } });
 }
 
+async function releaseReservedBudget(jobs, proposal, now = new Date()) {
+  if (!proposal?.jobId) return;
+
+  const rawJobId = String(proposal.jobId || "").trim();
+  if (!rawJobId) return;
+
+  const amount = getReservedAmount(proposal);
+  if (amount <= 0) return;
+
+  const objectJobId = toObjectId(rawJobId);
+  const jobLookup = objectJobId
+    ? { $or: [{ _id: objectJobId }, { _id: rawJobId }, { jobId: rawJobId }] }
+    : { $or: [{ _id: rawJobId }, { jobId: rawJobId }] };
+
+  const job = await jobs.findOne(jobLookup);
+  if (!job) return;
+
+  await jobs.updateOne({ _id: job._id }, { $inc: { budget: amount }, $set: { updatedAt: now } });
+}
+
 function resolveUserQuery(rawUserId) {
   const userId = String(rawUserId || "").trim();
   if (!userId) return null;
@@ -72,6 +105,15 @@ function resolveUserQuery(rawUserId) {
   }
 
   return { $or: [{ _id: userId }, { userId }] };
+}
+
+function resolveJobLookup(rawJobId) {
+  const jobId = String(rawJobId || "").trim();
+  if (!jobId) return null;
+
+  const objectId = toObjectId(jobId);
+  if (objectId) return { $or: [{ _id: objectId }, { _id: jobId }, { jobId }] };
+  return { $or: [{ _id: jobId }, { jobId }] };
 }
 
 async function getParamId(params) {
@@ -117,6 +159,7 @@ export async function PUT(req, { params }) {
 
     const db = await getDb();
     const proposals = db.collection("proposals");
+    const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
     const proposal = await proposals.findOne(query);
     if (!proposal) return json({ message: "Proposal not found" }, 404, req);
 
@@ -138,12 +181,41 @@ export async function PUT(req, { params }) {
       return json({ message: "Price must be greater than 0" }, 400, req);
     }
 
+    const jobQuery = resolveJobLookup(proposal.jobId);
+    const currentReserved = getReservedAmount(proposal);
+    if (jobQuery) {
+      const job = await jobs.findOne(jobQuery);
+      if (job) {
+        const jobBudget = normalizeBudget(job.budget);
+        const availableBudget = jobBudget + currentReserved;
+        if (availableBudget > 0 && price > availableBudget) {
+          return json({ message: "Proposal price cannot exceed client job budget" }, 400, req);
+        }
+
+        const delta = price - currentReserved;
+        if (delta !== 0) {
+          const nextBudget = Math.max(0, jobBudget - delta);
+          await jobs.updateOne(
+            { _id: job._id },
+            {
+              $set: {
+                budget: nextBudget,
+                budgetOriginal: normalizeBudget(job.budgetOriginal || job.budget),
+                updatedAt: new Date(),
+              },
+            }
+          );
+        }
+      }
+    }
+
     if (message.length < 20) {
       return json({ message: "Message must be at least 20 characters" }, 400, req);
     }
 
     const update = {
       price,
+      reservedAmount: price,
       message,
       updatedAt: new Date(),
     };
@@ -189,13 +261,16 @@ export async function DELETE(req, { params }) {
       return json({ message: "Forbidden" }, 403, req);
     }
 
+    const currentStatus = String(proposal.status || "submitted").trim().toLowerCase();
     if (isAdmin) {
+      if (currentStatus === "submitted") {
+        await releaseReservedBudget(jobs, proposal, new Date());
+      }
       await proposals.deleteOne({ _id: proposal._id });
       await decrementJobProposalCount(jobs, proposal, new Date());
       return json({ ok: true, deleted: true }, 200, req);
     }
 
-    const currentStatus = String(proposal.status || "submitted").trim().toLowerCase();
     if (currentStatus !== "submitted") {
       return json({ message: "Only submitted proposals can be withdrawn" }, 400, req);
     }
@@ -206,6 +281,7 @@ export async function DELETE(req, { params }) {
       { $set: { status: "withdrawn", updatedAt: now } }
     );
     await decrementJobProposalCount(jobs, proposal, now);
+    await releaseReservedBudget(jobs, proposal, now);
 
     let withdrawCount = 0;
     let deactivated = false;

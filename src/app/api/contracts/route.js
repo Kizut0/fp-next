@@ -53,6 +53,25 @@ function resolveJobQuery(rawId) {
   return { $or: [{ _id: id }, { jobId: id }] };
 }
 
+function normalizeBudget(value) {
+  const budget = Number(value);
+  return Number.isFinite(budget) && budget > 0 ? budget : 0;
+}
+
+function sameId(a, b) {
+  const left = String(a || "").trim();
+  const right = String(b || "").trim();
+  return Boolean(left && right && left === right);
+}
+
+function getReservedAmount(proposal = {}) {
+  const reserved = Number(proposal.reservedAmount);
+  if (Number.isFinite(reserved) && reserved > 0) return reserved;
+
+  const price = Number(proposal.price);
+  return Number.isFinite(price) && price > 0 ? price : 0;
+}
+
 export async function OPTIONS(req) {
   return options(req);
 }
@@ -121,14 +140,63 @@ export async function POST(req) {
         return json({ message: "Contract already exists for this proposal", contract: cleanDoc(existing) }, 409, req);
       }
 
+      const proposalAmount = Number(proposal.price || 0);
+      if (!Number.isFinite(proposalAmount) || proposalAmount <= 0) {
+        return json({ message: "Invalid proposal amount" }, 400, req);
+      }
+      const proposalReserved = getReservedAmount(proposal);
+      const requiredExtra = Math.max(0, proposalAmount - proposalReserved);
+
       const now = new Date();
+      const jobQuery = resolveJobQuery(proposal.jobId);
+      if (jobQuery) {
+        const job = await jobs.findOne(jobQuery);
+        if (job) {
+          const jobBudget = normalizeBudget(job.budget);
+          if (jobBudget > 0 && requiredExtra > jobBudget) {
+            return json({ message: "Proposal price cannot exceed client job budget" }, 400, req);
+          }
+
+          const alreadyAccepted = String(job.acceptedProposalId || "").trim();
+          if (alreadyAccepted && !sameId(alreadyAccepted, proposal._id)) {
+            return json({ message: "Another proposal has already been accepted for this job" }, 409, req);
+          }
+
+          const otherSubmitted = await proposals
+            .find({
+              _id: { $ne: proposal._id },
+              jobId: proposal.jobId,
+              status: "submitted",
+            })
+            .toArray();
+          const sumOtherReserved = otherSubmitted.reduce((sum, item) => sum + getReservedAmount(item), 0);
+          const nextBudget = Math.max(0, jobBudget - requiredExtra + sumOtherReserved);
+          const originalBudget = normalizeBudget(job.budgetOriginal || job.budget);
+          await jobs.updateOne(
+            { _id: job._id },
+            {
+              $set: {
+                status: "closed",
+                budget: nextBudget,
+                budgetOriginal: originalBudget,
+                acceptedProposalId: proposal._id,
+                acceptedFreelancerId: proposal.freelancerId,
+                acceptedAmount: proposalAmount,
+                budgetReducedAt: now,
+                updatedAt: now,
+              },
+            }
+          );
+        }
+      }
+
       const doc = {
         proposalId: proposal._id,
         jobId: proposal.jobId,
         jobTitle: proposal.jobTitle || "Untitled Project",
         clientId: String(proposal.clientId || auth.user.id || "").trim(),
         freelancerId: String(proposal.freelancerId || "").trim(),
-        amount: Number(proposal.price || 0),
+        amount: proposalAmount,
         status: "active",
         startDate: now,
         createdAt: now,
@@ -136,13 +204,15 @@ export async function POST(req) {
       };
 
       const inserted = await contracts.insertOne(doc);
-
       await proposals.updateOne({ _id: proposal._id }, { $set: { status: "accepted", updatedAt: now } });
-
-      const jobQuery = resolveJobQuery(proposal.jobId);
-      if (jobQuery) {
-        await jobs.updateOne(jobQuery, { $set: { status: "closed", updatedAt: now } });
-      }
+      await proposals.updateMany(
+        {
+          _id: { $ne: proposal._id },
+          jobId: proposal.jobId,
+          status: "submitted",
+        },
+        { $set: { status: "rejected", updatedAt: now } }
+      );
 
       return json(cleanDoc({ ...doc, _id: inserted.insertedId }), 201, req);
     }

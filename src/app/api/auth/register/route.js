@@ -16,15 +16,11 @@ export async function POST(req) {
             return json({ message: "Name, email and password are required" }, 400);
         }
 
-        const roleMap = {
-            client: "Client",
-            freelancer: "Freelancer",
-            admin: "Admin",
-            Client: "Client",
-            Freelancer: "Freelancer",
-            Admin: "Admin",
-        };
-        const safeRole = roleMap[role] || "Freelancer";
+        const requestedRole = String(role || "").trim().toLowerCase();
+        if (requestedRole === "admin") {
+            return json({ message: "Admin registration is not allowed" }, 403);
+        }
+        const safeRole = requestedRole === "client" ? "Client" : "Freelancer";
 
         const db = await getDb();
         const users = db.collection(process.env.USER_COLLECTION || "userData");

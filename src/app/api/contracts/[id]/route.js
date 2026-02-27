@@ -234,13 +234,13 @@ export async function PUT(req, { params }) {
       });
     }
 
-    if (auth.user.role !== "Admin" && nextStatus === "completed" && !areAllMilestonesReleased(nextMilestones)) {
-      return json(
-        { message: "All milestones must be released before marking contract completed" },
-        400,
-        req
-      );
-    }
+    // if (auth.user.role !== "Admin" && nextStatus === "completed" && !areAllMilestonesReleased(nextMilestones)) {
+    //   return json(
+    //     { message: "All milestones must be released before marking contract completed" },
+    //     400,
+    //     req
+    //   );
+    // }
 
     const startDate =
       payload.startDate !== undefined

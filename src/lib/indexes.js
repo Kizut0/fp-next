@@ -55,7 +55,7 @@ export async function ensureContractIndexes(contracts) {
     { proposalId: 1 },
     {
       unique: true,
-      partialFilterExpression: { proposalId: { $exists: true, $ne: null } },
+      partialFilterExpression: { proposalId: { $type: "string" } },
     }
   );
 

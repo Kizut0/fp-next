@@ -729,7 +729,7 @@ export async function ensurePaymentLedgerIndexes(ledgerCollection) {
       {
         name: "uniq_ledger_source_event_payment",
         unique: true,
-        partialFilterExpression: { eventId: { $exists: true, $ne: "" } },
+        partialFilterExpression: { eventId: { $type: "string" } },
       }
     ),
     ledgerCollection.createIndex(
@@ -737,7 +737,7 @@ export async function ensurePaymentLedgerIndexes(ledgerCollection) {
       {
         name: "uniq_ledger_payment_idempotency",
         unique: true,
-        partialFilterExpression: { idempotencyKey: { $exists: true, $ne: "" } },
+        partialFilterExpression: { idempotencyKey: { $type: "string" } },
       }
     ),
   ];

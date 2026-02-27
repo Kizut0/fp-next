@@ -5,6 +5,8 @@ import {
   buildContractCompletionRequest,
   buildMilestoneSummary,
   ensureContractMilestones,
+  hydrateMilestonesWithSla,
+  normalizeMilestoneEscalations,
   normalizeMilestonesForContract,
 } from "../../../../lib/contractMilestones";
 
@@ -70,16 +72,20 @@ function canMutateContract(authUser, contract) {
 }
 
 function normalizeContractForResponse(contract) {
-  const milestones = ensureContractMilestones(contract);
+  const escalations = normalizeMilestoneEscalations(contract?.escalations);
+  const milestones = hydrateMilestonesWithSla(ensureContractMilestones(contract), {
+    escalations,
+  });
   const changeOrders = Array.isArray(contract?.changeOrders) ? contract.changeOrders : [];
   return {
     ...contract,
     milestones,
-    milestoneSummary: buildMilestoneSummary(milestones),
+    milestoneSummary: buildMilestoneSummary(milestones, { escalations }),
     completionRequest: buildContractCompletionRequest(
       milestones,
       contract?.completionRequest?.milestoneKey
     ),
+    escalations,
     changeOrders,
   };
 }
@@ -250,7 +256,9 @@ export async function PUT(req, { params }) {
       amount,
       status: nextStatus,
       milestones: nextMilestones,
-      milestoneSummary: buildMilestoneSummary(nextMilestones),
+      milestoneSummary: buildMilestoneSummary(nextMilestones, {
+        escalations: contract?.escalations || [],
+      }),
       completionRequest: buildContractCompletionRequest(nextMilestones),
       jobTitle:
         payload.jobTitle !== undefined

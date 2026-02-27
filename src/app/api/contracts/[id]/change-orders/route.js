@@ -5,6 +5,8 @@ import {
   buildMilestoneSummary,
   ensureContractMilestones,
   findMilestoneByKey,
+  hydrateMilestonesWithSla,
+  normalizeMilestoneEscalations,
 } from "../../../../../lib/contractMilestones";
 import {
   buildPaymentContractQuery,
@@ -130,15 +132,19 @@ function normalizeStoredChangeOrders(changeOrders = []) {
 }
 
 function normalizeContractForResponse(contract) {
-  const milestones = ensureContractMilestones(contract);
+  const escalations = normalizeMilestoneEscalations(contract?.escalations);
+  const milestones = hydrateMilestonesWithSla(ensureContractMilestones(contract), {
+    escalations,
+  });
   return {
     ...contract,
     milestones,
-    milestoneSummary: buildMilestoneSummary(milestones),
+    milestoneSummary: buildMilestoneSummary(milestones, { escalations }),
     completionRequest: buildContractCompletionRequest(
       milestones,
       contract?.completionRequest?.milestoneKey
     ),
+    escalations,
     changeOrders: normalizeStoredChangeOrders(contract?.changeOrders),
   };
 }
@@ -451,7 +457,9 @@ export async function PATCH(req, { params }) {
       updatedAt: now,
     };
 
-    const nextSummary = buildMilestoneSummary(nextMilestones);
+    const nextSummary = buildMilestoneSummary(nextMilestones, {
+      escalations: contract?.escalations || [],
+    });
     await contracts.updateOne(
       { _id: contract._id },
       {

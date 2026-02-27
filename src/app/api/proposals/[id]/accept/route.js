@@ -9,6 +9,8 @@ import {
   buildContractCompletionRequest,
   buildMilestoneSummary,
   ensureContractMilestones,
+  hydrateMilestonesWithSla,
+  normalizeMilestoneEscalations,
   normalizeMilestonesForContract,
 } from "../../../../../lib/contractMilestones";
 
@@ -75,16 +77,20 @@ function getReservedAmount(proposal = {}) {
 }
 
 function normalizeContractForResponse(contract) {
-  const milestones = ensureContractMilestones(contract);
+  const escalations = normalizeMilestoneEscalations(contract?.escalations);
+  const milestones = hydrateMilestonesWithSla(ensureContractMilestones(contract), {
+    escalations,
+  });
   const changeOrders = Array.isArray(contract?.changeOrders) ? contract.changeOrders : [];
   return {
     ...contract,
     milestones,
-    milestoneSummary: buildMilestoneSummary(milestones),
+    milestoneSummary: buildMilestoneSummary(milestones, { escalations }),
     completionRequest: buildContractCompletionRequest(
       milestones,
       contract?.completionRequest?.milestoneKey
     ),
+    escalations,
     changeOrders,
   };
 }
@@ -234,8 +240,9 @@ export async function PATCH(req, { params }) {
         freelancerId: proposal.freelancerId,
         amount: milestoneResult.totalAmount,
         milestones: milestoneResult.milestones,
-        milestoneSummary: buildMilestoneSummary(milestoneResult.milestones),
+        milestoneSummary: buildMilestoneSummary(milestoneResult.milestones, { escalations: [] }),
         completionRequest: buildContractCompletionRequest(milestoneResult.milestones),
+        escalations: [],
         changeOrders: [],
         status: "active",
         startDate: now,

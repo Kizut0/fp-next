@@ -1,10 +1,12 @@
 import { getDb } from "../../../../../lib/mongodb";
 import { cleanDoc, json, options, requireAuth, toObjectId } from "../../../../../lib/api";
 import {
+  appendEscrowLedgerEntry,
   buildPaymentContractQuery,
   buildDefaultDisputeState,
   buildPaymentStatusHistoryEntry,
   canTransitionPaymentStatus,
+  ensurePaymentLedgerIndexes,
   ensurePaymentIndexes,
   hasOpenDispute,
   isActivePaymentStatus,
@@ -18,7 +20,9 @@ import {
   buildContractCompletionRequest,
   buildMilestoneSummary,
   ensureContractMilestones,
+  hydrateMilestonesWithSla,
   normalizeCompletionRequest,
+  normalizeMilestoneEscalations,
   pickMilestoneForAction,
 } from "../../../../../lib/contractMilestones";
 
@@ -74,12 +78,14 @@ function buildDefaultMilestonePaymentQuery(contract, milestoneKey = "default") {
 
 async function upsertMilestonePayment({
   payments,
+  ledger,
   contract,
   milestone,
   toStatus,
   action,
   reason,
   actorId,
+  actorRole = "",
   now,
 }) {
   const milestoneKey = normalizeMilestoneKey(milestone?.key);
@@ -97,12 +103,13 @@ async function upsertMilestonePayment({
     if (!clientId || !freelancerId || !Number.isFinite(amount) || amount <= 0) return;
 
     const canonicalId = normalizeCanonicalContractId(contract, normalizeId(contract.contractId));
-    await payments.insertOne({
+    const doc = {
       contractId: canonicalId,
       milestoneKey,
       clientId,
       freelancerId,
       amount,
+      currency: "THB",
       status: toStatus,
       isActive: isActivePaymentStatus(toStatus),
       note: reason,
@@ -119,6 +126,18 @@ async function upsertMilestonePayment({
       ],
       createdAt: now,
       updatedAt: now,
+    };
+    const inserted = await payments.insertOne(doc);
+    await appendEscrowLedgerEntry(ledger, {
+      payment: { ...doc, _id: inserted.insertedId },
+      fromStatus: "",
+      toStatus,
+      action,
+      reason,
+      actorId,
+      actorRole,
+      source: "contract_completion",
+      at: now,
     });
     return;
   }
@@ -155,6 +174,20 @@ async function upsertMilestonePayment({
       },
     }
   );
+
+  const updated = await payments.findOne({ _id: existingPayment._id });
+  if (!updated) return;
+  await appendEscrowLedgerEntry(ledger, {
+    payment: updated,
+    fromStatus: paymentStatus,
+    toStatus,
+    action,
+    reason,
+    actorId,
+    actorRole,
+    source: "contract_completion",
+    at: now,
+  });
 }
 
 function resolveContractClientId(contract) {
@@ -187,6 +220,25 @@ function canFreelancerSubmit(authUser, contract) {
   if (!userId || !freelancerId) return false;
 
   return authUser.role === "Freelancer" && userId === freelancerId;
+}
+
+function normalizeContractForResponse(contract) {
+  const escalations = normalizeMilestoneEscalations(contract?.escalations);
+  const milestones = hydrateMilestonesWithSla(ensureContractMilestones(contract), {
+    escalations,
+  });
+  const changeOrders = Array.isArray(contract?.changeOrders) ? contract.changeOrders : [];
+  return {
+    ...contract,
+    milestones,
+    milestoneSummary: buildMilestoneSummary(milestones, { escalations }),
+    completionRequest: buildContractCompletionRequest(
+      milestones,
+      contract?.completionRequest?.milestoneKey
+    ),
+    escalations,
+    changeOrders,
+  };
 }
 
 function normalizeJobIdVariants(contract) {
@@ -244,6 +296,10 @@ export async function PATCH(req, { params }) {
 
     const db = await getDb();
     const contracts = db.collection("contracts");
+    const payments = db.collection("payments");
+    const ledger = db.collection(process.env.PAYMENT_LEDGER_COLLECTION || "paymentLedger");
+    await ensurePaymentIndexes(payments);
+    await ensurePaymentLedgerIndexes(ledger);
     const contract = await contracts.findOne(query);
     if (!contract) return json({ message: "Contract not found" }, 404, req);
 
@@ -285,9 +341,6 @@ export async function PATCH(req, { params }) {
       if (!link && !attachment) {
         return json({ message: "Attach at least one delivery link or file" }, 400, req);
       }
-      const payments = db.collection("payments");
-      await ensurePaymentIndexes(payments);
-
       if (currentRequest.status === "pending") {
         return json({ message: "This milestone already has a pending submission" }, 409, req);
       }
@@ -322,12 +375,14 @@ export async function PATCH(req, { params }) {
 
       await upsertMilestonePayment({
         payments,
+        ledger,
         contract,
         milestone: nextMilestone,
         toStatus: "in_review",
         action: "contract_submit",
         reason: "Freelancer submitted milestone work for review",
         actorId: authId,
+        actorRole: normalizeId(auth.user.role),
         now,
       });
 
@@ -348,9 +403,6 @@ export async function PATCH(req, { params }) {
         return json({ message: "No pending completion request to accept for this milestone" }, 400, req);
       }
 
-      const payments = db.collection("payments");
-      await ensurePaymentIndexes(payments);
-
       nextMilestone = {
         ...currentMilestone,
         status: "released",
@@ -365,12 +417,14 @@ export async function PATCH(req, { params }) {
 
       await upsertMilestonePayment({
         payments,
+        ledger,
         contract,
         milestone: nextMilestone,
         toStatus: "released",
         action: "contract_accept",
         reason: "Client accepted milestone completion request",
         actorId: authId,
+        actorRole: normalizeId(auth.user.role),
         now,
       });
     }
@@ -388,9 +442,6 @@ export async function PATCH(req, { params }) {
         return json({ message: "No pending completion request to reject for this milestone" }, 400, req);
       }
 
-      const payments = db.collection("payments");
-      await ensurePaymentIndexes(payments);
-
       nextMilestone = {
         ...currentMilestone,
         status: "pending",
@@ -405,12 +456,14 @@ export async function PATCH(req, { params }) {
 
       await upsertMilestonePayment({
         payments,
+        ledger,
         contract,
         milestone: nextMilestone,
         toStatus: "reserved",
         action: "contract_reject",
         reason: "Client rejected milestone completion request",
         actorId: authId,
+        actorRole: normalizeId(auth.user.role),
         now,
       });
 
@@ -432,7 +485,9 @@ export async function PATCH(req, { params }) {
     contractUpdate.status =
       String(contract.status || "").toLowerCase() === "cancelled" ? "cancelled" : nextContractStatus;
     contractUpdate.milestones = nextMilestones;
-    contractUpdate.milestoneSummary = buildMilestoneSummary(nextMilestones);
+    contractUpdate.milestoneSummary = buildMilestoneSummary(nextMilestones, {
+      escalations: contract?.escalations || [],
+    });
     contractUpdate.completionRequest = buildContractCompletionRequest(nextMilestones, milestoneKey);
     contractUpdate.updatedAt = now;
     if (contractUpdate.status === "completed") {
@@ -442,7 +497,7 @@ export async function PATCH(req, { params }) {
     await contracts.updateOne({ _id: contract._id }, { $set: contractUpdate });
 
     const updated = await contracts.findOne({ _id: contract._id });
-    return json(cleanDoc(updated), 200, req);
+    return json(cleanDoc(normalizeContractForResponse(updated)), 200, req);
   } catch (error) {
     return json({ message: "Failed to process completion request", error: error.message }, 500, req);
   }

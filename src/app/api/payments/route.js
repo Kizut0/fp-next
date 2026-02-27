@@ -3,29 +3,38 @@ import { cleanDoc, cleanDocs, json, options, requireAuth, toObjectId } from "../
 import { ensureContractMilestones, findMilestoneByKey } from "../../../lib/contractMilestones";
 import {
   ACTIVE_PAYMENT_STATUSES,
+  appendDisputeEvidence,
+  appendEscrowLedgerEntry,
+  buildDisputeMediationUpdate,
   buildDefaultDisputeState,
   buildDisputeOpenState,
   buildDisputeResolvedState,
   buildIdempotencyEntry,
   buildPaymentContractQuery,
   buildPaymentStatusHistoryEntry,
+  canReconcileProviderStatus,
   canTransitionPaymentStatus,
+  ensurePaymentLedgerIndexes,
   ensurePaymentIndexes,
   hasIdempotencyKey,
   hasOpenDispute,
   isActivePaymentStatus,
   normalizeCanonicalContractId,
+  normalizeDisputeStage,
+  normalizeDisputeState,
   normalizeId,
   normalizeIdempotencyKey,
   normalizeMilestoneKey,
   normalizePaymentStatus,
   normalizeResolution,
+  resolveDisputeSlaHours,
 } from "../../../lib/payments";
 
 export const dynamic = "force-dynamic";
 
 const CLIENT_ALLOWED_CREATE_STATUSES = new Set(["reserved", "in_review"]);
-const MUTATION_ACTIONS = new Set(["transition", "dispute", "resolve", "withdraw"]);
+const MUTATION_ACTIONS = new Set(["transition", "dispute", "resolve", "withdraw", "evidence", "mediate"]);
+const MEDIATION_STAGE_ACTIONS = new Set(["evidence", "mediation", "decision"]);
 
 function normalizeContractQuery(rawId) {
   const id = normalizeId(rawId);
@@ -119,6 +128,13 @@ function canWithdrawPayment(authUser, payment) {
   return normalizeId(payment?.freelancerId) === actorId;
 }
 
+function canContributeDisputeEvidence(authUser, payment) {
+  if (authUser.role === "Admin") return true;
+  const actorId = normalizeId(authUser.id);
+  if (!actorId) return false;
+  return normalizeId(payment?.clientId) === actorId || normalizeId(payment?.freelancerId) === actorId;
+}
+
 function normalizeMutationAction(payload = {}) {
   const raw = normalizeId(payload.action).toLowerCase();
   if (raw) return raw;
@@ -128,6 +144,36 @@ function normalizeMutationAction(payload = {}) {
 
 function normalizeNote(value, maxLen = 1500) {
   return normalizeId(value).slice(0, maxLen);
+}
+
+function normalizeProviderName(value) {
+  return normalizeId(value).slice(0, 120);
+}
+
+function normalizeProviderPaymentId(value) {
+  return normalizeId(value).slice(0, 180);
+}
+
+function normalizeProviderEventType(value) {
+  return normalizeId(value).slice(0, 120);
+}
+
+function normalizeProviderRawStatus(value) {
+  return normalizeId(value).slice(0, 80);
+}
+
+function resolveEvidencePayload(payload = {}) {
+  const direct = payload.evidence || payload.evidenceItems || payload.files || payload.links;
+  if (Array.isArray(direct)) return direct;
+  if (direct && typeof direct === "object") return [direct];
+
+  const fallback = [];
+  const link = normalizeId(payload.evidenceLink || payload.link || payload.url);
+  if (link) fallback.push({ type: "link", url: link });
+
+  const fileData = payload.evidenceFile || payload.file || payload.attachment;
+  if (fileData && typeof fileData === "object") fallback.push(fileData);
+  return fallback;
 }
 
 function resolveIdempotencyKey(req, payload = {}) {
@@ -157,6 +203,7 @@ function normalizePaymentForResponse(payment) {
     ...payment,
     status,
     milestoneKey: normalizeMilestoneKey(payment?.milestoneKey),
+    dispute: normalizeDisputeState(payment?.dispute || {}, { now: new Date() }),
     isActive:
       typeof payment?.isActive === "boolean"
         ? payment.isActive
@@ -293,6 +340,13 @@ export async function POST(req) {
     const amountInput = payload.amount;
     const status = normalizePaymentStatus(payload.status, "reserved");
     const note = normalizeNote(payload.note);
+    const currency = normalizeNote(payload.currency || "THB", 16).toUpperCase() || "THB";
+    const providerName = normalizeProviderName(payload.provider || payload.providerName);
+    const providerPaymentId = normalizeProviderPaymentId(
+      payload.providerPaymentId || payload.externalPaymentId || payload.processorPaymentId
+    );
+    const providerEventType = normalizeProviderEventType(payload.providerEventType || payload.eventType);
+    const providerRawStatus = normalizeProviderRawStatus(payload.providerStatus || payload.rawStatus);
     const idempotencyKey = resolveIdempotencyKey(req, payload);
 
     if (!contractIdInput) {
@@ -318,7 +372,9 @@ export async function POST(req) {
 
     const db = await getDb();
     const payments = db.collection("payments");
+    const ledger = db.collection(process.env.PAYMENT_LEDGER_COLLECTION || "paymentLedger");
     await ensurePaymentIndexes(payments);
+    await ensurePaymentLedgerIndexes(ledger);
 
     const contract = await db.collection("contracts").findOne(contractQuery);
     if (!contract) {
@@ -464,6 +520,10 @@ export async function POST(req) {
         reason,
         openedBy: normalizeId(auth.user.id),
         now: new Date(),
+        evidence: resolveEvidencePayload(payload),
+        stage: normalizeDisputeStage(payload.stage || payload.mediationStage, "evidence"),
+        note: normalizeNote(payload.mediationNote || payload.note, 1500),
+        slaHours: resolveDisputeSlaHours(payload.slaHours),
       });
     }
 
@@ -474,10 +534,18 @@ export async function POST(req) {
       clientId,
       freelancerId,
       amount,
+      currency,
       status,
       isActive: isActivePaymentStatus(status),
       note,
-      dispute,
+      dispute: normalizeDisputeState(dispute, { now }),
+      provider: {
+        name: providerName,
+        paymentId: providerPaymentId,
+        lastEventType: providerEventType,
+        rawStatus: providerRawStatus,
+        reconciledAt: null,
+      },
       statusHistory: [
         buildPaymentStatusHistoryEntry({
           action: "create",
@@ -506,8 +574,22 @@ export async function POST(req) {
 
     try {
       const result = await payments.insertOne(doc);
+      const insertedDoc = { ...doc, _id: result.insertedId };
+      await appendEscrowLedgerEntry(ledger, {
+        payment: insertedDoc,
+        fromStatus: "",
+        toStatus: status,
+        action: "create",
+        reason: note || "payment_created",
+        actorId: normalizeId(auth.user.id),
+        actorRole: normalizeId(auth.user.role),
+        source: "payments_api",
+        idempotencyKey,
+        at: now,
+        provider: insertedDoc.provider,
+      });
       return json(
-        cleanDoc(normalizePaymentForResponse({ ...doc, _id: result.insertedId })),
+        cleanDoc(normalizePaymentForResponse(insertedDoc)),
         201,
         req
       );
@@ -557,7 +639,7 @@ export async function PATCH(req) {
     const action = normalizeMutationAction(payload);
     if (!MUTATION_ACTIONS.has(action)) {
       return json(
-        { message: "Invalid action. Use transition, dispute, resolve, or withdraw." },
+        { message: "Invalid action. Use transition, dispute, resolve, withdraw, evidence, or mediate." },
         400,
         req
       );
@@ -565,8 +647,10 @@ export async function PATCH(req) {
 
     const db = await getDb();
     const payments = db.collection("payments");
+    const ledger = db.collection(process.env.PAYMENT_LEDGER_COLLECTION || "paymentLedger");
     const users = db.collection(process.env.USER_COLLECTION || "userData");
     await ensurePaymentIndexes(payments);
+    await ensurePaymentLedgerIndexes(ledger);
 
     const payment = await resolvePaymentFromPayload(payments, payload);
     if (!payment) {
@@ -601,12 +685,13 @@ export async function PATCH(req) {
     let nextStatus = currentStatus;
     let reason = "";
     const updateSet = {};
+    const currentDispute = normalizeDisputeState(payment.dispute || {}, { now });
 
     if (action === "dispute") {
       if (!canDisputePayment(auth.user, payment)) {
         return json({ message: "Only payment owner client can open dispute" }, 403, req);
       }
-      if (hasOpenDispute(payment)) {
+      if (hasOpenDispute({ ...payment, dispute: currentDispute })) {
         return json({ message: "Dispute is already open for this payment" }, 409, req);
       }
 
@@ -620,6 +705,10 @@ export async function PATCH(req) {
         reason,
         openedBy: actorId,
         now,
+        evidence: resolveEvidencePayload(payload),
+        stage: normalizeDisputeStage(payload.stage || payload.mediationStage, "evidence"),
+        note: normalizeNote(payload.mediationNote || payload.note, 1500),
+        slaHours: resolveDisputeSlaHours(payload.slaHours),
       });
     }
 
@@ -627,7 +716,7 @@ export async function PATCH(req) {
       if (auth.user.role !== "Admin") {
         return json({ message: "Only admin can resolve disputes" }, 403, req);
       }
-      if (!hasOpenDispute(payment)) {
+      if (!hasOpenDispute({ ...payment, dispute: currentDispute })) {
         return json({ message: "No open dispute to resolve for this payment" }, 400, req);
       }
 
@@ -640,7 +729,7 @@ export async function PATCH(req) {
       reason = resolutionNote || `resolved:${resolution}`;
       nextStatus = resolution === "release" ? "released" : "refunded";
       updateSet.dispute = buildDisputeResolvedState({
-        previous: payment.dispute,
+        previous: currentDispute,
         resolution,
         resolutionNote,
         resolvedBy: actorId,
@@ -652,12 +741,62 @@ export async function PATCH(req) {
       if (!canWithdrawPayment(auth.user, payment)) {
         return json({ message: "Only admin/freelancer owner can withdraw released payments" }, 403, req);
       }
-      if (hasOpenDispute(payment)) {
+      if (hasOpenDispute({ ...payment, dispute: currentDispute })) {
         return json({ message: "Cannot withdraw while dispute is open" }, 409, req);
       }
 
       nextStatus = "withdrawn";
       reason = normalizeNote(payload.reason || payload.note || "freelancer_withdraw");
+    }
+
+    if (action === "evidence") {
+      if (!canContributeDisputeEvidence(auth.user, payment)) {
+        return json({ message: "Only client/freelancer owner/admin can add dispute evidence" }, 403, req);
+      }
+      if (!hasOpenDispute({ ...payment, dispute: currentDispute })) {
+        return json({ message: "No open dispute to add evidence" }, 409, req);
+      }
+
+      const evidence = resolveEvidencePayload(payload);
+      if (!evidence.length) {
+        return json({ message: "evidence is required (file/link list)" }, 400, req);
+      }
+
+      reason = normalizeNote(payload.note || payload.evidenceNote || "dispute_evidence_added");
+      updateSet.dispute = appendDisputeEvidence({
+        previous: currentDispute,
+        evidence,
+        actorId,
+        note: reason,
+        now,
+      });
+    }
+
+    if (action === "mediate") {
+      if (auth.user.role !== "Admin") {
+        return json({ message: "Only admin can update mediation stage" }, 403, req);
+      }
+      if (!hasOpenDispute({ ...payment, dispute: currentDispute })) {
+        return json({ message: "No open dispute to mediate" }, 409, req);
+      }
+
+      const requestedStage = normalizeId(payload.stage || payload.mediationStage).toLowerCase();
+      if (!MEDIATION_STAGE_ACTIONS.has(requestedStage)) {
+        return json({ message: "stage must be one of: evidence, mediation, decision" }, 400, req);
+      }
+
+      reason = normalizeNote(payload.note || payload.mediationNote || `stage:${requestedStage}`);
+      updateSet.dispute = buildDisputeMediationUpdate({
+        previous: currentDispute,
+        stage: requestedStage,
+        note: reason,
+        actorId,
+        now,
+        slaHours:
+          payload.slaHours !== undefined
+            ? resolveDisputeSlaHours(payload.slaHours)
+            : undefined,
+      });
     }
 
     if (action === "transition") {
@@ -679,7 +818,7 @@ export async function PATCH(req) {
       }
 
       if (nextStatus === "disputed") {
-        if (hasOpenDispute(payment)) {
+        if (hasOpenDispute({ ...payment, dispute: currentDispute })) {
           return json({ message: "Dispute is already open for this payment" }, 409, req);
         }
 
@@ -692,16 +831,33 @@ export async function PATCH(req) {
           reason,
           openedBy: actorId,
           now,
+          evidence: resolveEvidencePayload(payload),
+          stage: normalizeDisputeStage(payload.stage || payload.mediationStage, "evidence"),
+          note: normalizeNote(payload.mediationNote || payload.note, 1500),
+          slaHours: resolveDisputeSlaHours(payload.slaHours),
         });
       } else {
-        if (hasOpenDispute(payment)) {
+        if (hasOpenDispute({ ...payment, dispute: currentDispute })) {
           return json({ message: "Open dispute must be resolved before changing to this status" }, 409, req);
         }
         reason = normalizeNote(payload.reason || payload.note || `${currentStatus} -> ${nextStatus}`);
       }
     }
 
-    if (!canTransitionPaymentStatus(currentStatus, nextStatus)) {
+    const sourceRaw = normalizeId(payload.source).toLowerCase();
+    const providerReconcile = sourceRaw === "provider" || sourceRaw === "webhook";
+    const providerName = normalizeProviderName(payload.provider || payload.providerName);
+    const providerPaymentId = normalizeProviderPaymentId(
+      payload.providerPaymentId || payload.externalPaymentId || payload.processorPaymentId
+    );
+    const providerEventId = normalizeNote(payload.eventId || payload.providerEventId, 180);
+    const providerEventType = normalizeProviderEventType(payload.providerEventType || payload.eventType || payload.type);
+    const providerRawStatus = normalizeProviderRawStatus(payload.providerStatus || payload.rawStatus || payload.status || payload.toStatus);
+    const transitionAllowed = providerReconcile
+      ? canReconcileProviderStatus(currentStatus, nextStatus)
+      : canTransitionPaymentStatus(currentStatus, nextStatus);
+
+    if (!transitionAllowed) {
       return json(
         {
           message: `Invalid payment status transition: ${currentStatus} -> ${nextStatus}`,
@@ -737,6 +893,32 @@ export async function PATCH(req) {
           req
         );
       }
+    }
+
+    const providerBase =
+      payment.provider && typeof payment.provider === "object" ? payment.provider : {};
+    const providerNext = {
+      ...providerBase,
+      ...(providerName ? { name: providerName } : {}),
+      ...(providerPaymentId ? { paymentId: providerPaymentId } : {}),
+      ...(providerEventType ? { lastEventType: providerEventType } : {}),
+      ...(providerEventId ? { lastEventId: providerEventId } : {}),
+      ...(providerRawStatus ? { rawStatus: providerRawStatus } : {}),
+      ...(providerReconcile ? { reconciledAt: now } : {}),
+    };
+    const hasProviderPatch =
+      providerName ||
+      providerPaymentId ||
+      providerEventType ||
+      providerEventId ||
+      providerRawStatus ||
+      providerReconcile;
+    if (hasProviderPatch) {
+      updateSet.provider = providerNext;
+    }
+
+    if (!reason) {
+      reason = normalizeNote(payload.note || `${action}:${currentStatus}->${nextStatus}`);
     }
 
     const update = {
@@ -798,6 +980,22 @@ export async function PATCH(req) {
     }
 
     const updated = await payments.findOne({ _id: payment._id });
+    if (statusChanged && updated) {
+      await appendEscrowLedgerEntry(ledger, {
+        payment: updated,
+        fromStatus: currentStatus,
+        toStatus: nextStatus,
+        action,
+        reason,
+        actorId,
+        actorRole: normalizeId(auth.user.role),
+        source: providerReconcile ? "provider_webhook" : "payments_api",
+        idempotencyKey,
+        eventId: providerEventId,
+        at: now,
+        provider: updated?.provider || providerNext,
+      });
+    }
     return json(cleanDoc(normalizePaymentForResponse(updated)), 200, req);
   } catch (error) {
     return json({ message: "Failed to update payment", error: error.message }, 500, req);

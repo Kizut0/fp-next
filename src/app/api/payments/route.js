@@ -264,6 +264,7 @@ async function findActiveConflict(payments, { contractIds = [], milestoneKey, ex
   if (!ids.length) return null;
 
   const query = {
+    archived: { $ne: true },
     contractId: { $in: ids },
     ...buildMilestoneMatchQuery(milestoneKey),
     $or: [{ isActive: true }, { status: buildActiveStatusQuery() }],
@@ -305,12 +306,16 @@ export async function GET(req) {
     const { searchParams } = new URL(req.url);
     const statusFilter = normalizePaymentStatus(searchParams.get("status"), "");
     const milestoneFilter = normalizeId(searchParams.get("milestoneKey") || searchParams.get("milestoneId"));
+    const includeArchived = String(searchParams.get("includeArchived") || "").trim().toLowerCase() === "true";
 
     const query = {};
     if (auth.user.role === "Client") query.clientId = auth.user.id;
     if (auth.user.role === "Freelancer") query.freelancerId = auth.user.id;
     if (statusFilter) query.status = buildStatusFilterQuery(statusFilter);
     if (milestoneFilter) query.milestoneKey = normalizeMilestoneKey(milestoneFilter);
+    if (!includeArchived || auth.user.role !== "Admin") {
+      query.archived = { $ne: true };
+    }
 
     const db = await getDb();
     const payments = db.collection("payments");
@@ -655,6 +660,9 @@ export async function PATCH(req) {
     const payment = await resolvePaymentFromPayload(payments, payload);
     if (!payment) {
       return json({ message: "Payment not found. Provide payment id or contractId/milestone." }, 404, req);
+    }
+    if (payment.archived === true) {
+      return json({ message: "This payment is archived and cannot be modified" }, 409, req);
     }
 
     const idempotencyKey = resolveIdempotencyKey(req, payload);
@@ -1006,28 +1014,118 @@ export async function DELETE(req) {
   const auth = requireAuth(req);
   if (auth.error) return auth.error;
 
+  if (auth.user.role !== "Admin") {
+    return json({ message: "Only admin can archive payments" }, 403, req);
+  }
+
   try {
     const { searchParams } = new URL(req.url);
-    const id = normalizeId(searchParams.get("id") || searchParams.get("paymentId"));
-
-    if (!id) return json({ message: "Payment id is required" }, 400, req);
-
-    if (auth.user.role !== "Admin") {
-      return json({ message: "Only admin can delete/void payments" }, 403, req);
+    const rawId = normalizeId(searchParams.get("id") || searchParams.get("paymentId"));
+    if (!rawId) {
+      return json({ message: "id/paymentId query parameter is required" }, 400, req);
     }
 
-    const query = normalizePaymentQuery(id);
+    const query = normalizePaymentQuery(rawId);
     if (!query) return json({ message: "Invalid payment id" }, 400, req);
 
     const db = await getDb();
     const payments = db.collection("payments");
+    const ledger = db.collection(process.env.PAYMENT_LEDGER_COLLECTION || "paymentLedger");
+    await ensurePaymentIndexes(payments);
+    await ensurePaymentLedgerIndexes(ledger);
+
     const payment = await payments.findOne(query);
-
     if (!payment) return json({ message: "Payment not found" }, 404, req);
+    if (payment.archived === true) {
+      return json(
+        {
+          ...cleanDoc(normalizePaymentForResponse(payment)),
+          idempotent: true,
+        },
+        200,
+        req
+      );
+    }
 
-    await payments.deleteOne({ _id: payment._id });
-    return json({ ok: true }, 200, req);
+    const currentStatus = normalizePaymentStatus(payment.status, "");
+    if (!currentStatus) {
+      return json({ message: "Current payment status is invalid" }, 409, req);
+    }
+    if (hasOpenDispute(payment)) {
+      return json({ message: "Cannot archive payment with an open dispute" }, 409, req);
+    }
+    if (["released", "withdrawn", "refunded"].includes(currentStatus)) {
+      return json(
+        { message: "Settled payments cannot be archived/deleted. Keep them for financial audit." },
+        409,
+        req
+      );
+    }
+
+    const actorId = normalizeId(auth.user.id);
+    const now = new Date();
+    const idempotencyKey = resolveIdempotencyKey(req, { action: "archive", id: rawId });
+
+    const update = {
+      $set: {
+        archived: true,
+        archivedAt: now,
+        archivedBy: actorId,
+        isActive: false,
+        updatedAt: now,
+      },
+      $push: {
+        statusHistory: {
+          $each: [
+            buildPaymentStatusHistoryEntry({
+              action: "archive",
+              fromStatus: currentStatus,
+              toStatus: currentStatus,
+              reason: "archived_by_admin",
+              actorId,
+              at: now,
+            }),
+          ],
+          $slice: -120,
+        },
+      },
+    };
+
+    if (idempotencyKey) {
+      update.$push.idempotencyLog = {
+        $each: [
+          buildIdempotencyEntry({
+            key: idempotencyKey,
+            action: "archive",
+            fromStatus: currentStatus,
+            toStatus: currentStatus,
+            actorId,
+            at: now,
+          }),
+        ],
+        $slice: -120,
+      };
+    }
+
+    await payments.updateOne({ _id: payment._id }, update);
+    const updated = await payments.findOne({ _id: payment._id });
+    if (updated) {
+      await appendEscrowLedgerEntry(ledger, {
+        payment: updated,
+        fromStatus: currentStatus,
+        toStatus: currentStatus,
+        action: "archive",
+        reason: "archived_by_admin",
+        actorId,
+        actorRole: normalizeId(auth.user.role),
+        source: "payments_api",
+        idempotencyKey,
+        at: now,
+      });
+    }
+
+    return json(cleanDoc(normalizePaymentForResponse(updated || payment)), 200, req);
   } catch (error) {
-    return json({ message: "Failed to delete payment", error: error.message }, 500, req);
+    return json({ message: "Failed to archive payment", error: error.message }, 500, req);
   }
 }

@@ -119,6 +119,11 @@ export async function PATCH(req, { params }) {
       payload = {};
     }
 
+    // Guard against JSON bodies like `null` or primitives that would crash on property access.
+    if (!payload || typeof payload !== "object") {
+      payload = {};
+    }
+
     const db = await getDb();
     const proposals = db.collection("proposals");
     const jobs = db.collection(process.env.JOB_COLLECTION || "Job");

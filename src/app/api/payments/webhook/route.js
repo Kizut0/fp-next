@@ -231,6 +231,9 @@ export async function POST(req) {
     if (!payment) {
       return json({ ok: true, ignored: "payment_not_found" }, 202, req);
     }
+    if (payment.archived === true) {
+      return json({ ok: true, ignored: "payment_archived" }, 202, req);
+    }
 
     const webhookKey = normalizeText(
       payload.idempotencyKey ||

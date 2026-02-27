@@ -497,19 +497,19 @@ export async function POST(req) {
       }
     }
 
-    if (isActivePaymentStatus(status)) {
-      const conflict = await findActiveConflict(payments, {
-        contractIds: contractIdCandidates,
-        milestoneKey,
-      });
-      if (conflict) {
-        return json(
-          { message: "Only one active payment is allowed per contract/milestone" },
-          409,
-          req
-        );
-      }
-    }
+    // if (isActivePaymentStatus(status)) {
+    //   const conflict = await findActiveConflict(payments, {
+    //     contractIds: contractIdCandidates,
+    //     milestoneKey,
+    //   });
+    //   if (conflict) {
+    //     return json(
+    //       { message: "Only one active payment is allowed per contract/milestone" },
+    //       409,
+    //       req
+    //     );
+    //   }
+    // }
 
     let dispute = buildDefaultDisputeState();
     if (status === "disputed") {

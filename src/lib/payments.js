@@ -15,6 +15,7 @@ const PAYMENT_STATUS_ALIASES = {
   hold: "reserved",
   pending: "in_review",
   paid: "released",
+  completed: "released",
 };
 
 export const ACTIVE_PAYMENT_STATUSES = new Set([
@@ -649,11 +650,11 @@ export async function appendEscrowLedgerEntry(ledgerCollection, options = {}) {
     ? { source: entry.source, eventId: entry.eventId, paymentId: entry.paymentId }
     : entry.idempotencyKey
       ? {
-          paymentId: entry.paymentId,
-          idempotencyKey: entry.idempotencyKey,
-          action: entry.action,
-          toStatus: entry.toStatus,
-        }
+        paymentId: entry.paymentId,
+        idempotencyKey: entry.idempotencyKey,
+        action: entry.action,
+        toStatus: entry.toStatus,
+      }
       : null;
 
   if (duplicateQuery) {

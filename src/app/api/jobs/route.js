@@ -11,7 +11,7 @@ const DEFAULTS = {
   locationType: "Remote",
 };
 
-const JOB_STATUSES = ["draft", "open", "in_progress", "completed", "cancelled"];
+const JOB_STATUSES = ["draft", "open", "in_progress", "completed", "cancelled", "hidden", "flagged"];
 const JOB_STATUS_ALIASES = {
   closed: "cancelled",
   "in-progress": "in_progress",
@@ -289,11 +289,11 @@ export async function POST(req) {
     const ownerFields = {
       ...(ownerId
         ? {
-            clientId: ownerId,
-            userId: ownerId,
-            ownerId,
-            createdBy: ownerId,
-          }
+          clientId: ownerId,
+          userId: ownerId,
+          ownerId,
+          createdBy: ownerId,
+        }
         : {}),
       ...(ownerEmail ? { clientEmail: ownerEmail } : {}),
       ...(ownerName ? { clientName: ownerName } : {}),

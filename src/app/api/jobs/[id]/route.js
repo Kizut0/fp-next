@@ -12,7 +12,7 @@ const DEFAULTS = {
 };
 const COMMITTED_JOB_STATUSES = new Set(["accepted", "active", "in_progress", "completed"]);
 
-const JOB_STATUSES = ["draft", "open", "in_progress", "completed", "cancelled"];
+const JOB_STATUSES = ["draft", "open", "in_progress", "completed", "cancelled", "hidden", "flagged"];
 const JOB_STATUS_ALIASES = {
   closed: "cancelled",
   "in-progress": "in_progress",

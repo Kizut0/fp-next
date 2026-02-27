@@ -558,15 +558,15 @@ export async function POST(req) {
       ],
       idempotencyLog: idempotencyKey
         ? [
-            buildIdempotencyEntry({
-              key: idempotencyKey,
-              action: "create",
-              fromStatus: "",
-              toStatus: status,
-              actorId: normalizeId(auth.user.id),
-              at: now,
-            }),
-          ]
+          buildIdempotencyEntry({
+            key: idempotencyKey,
+            action: "create",
+            fromStatus: "",
+            toStatus: status,
+            actorId: normalizeId(auth.user.id),
+            at: now,
+          }),
+        ]
         : [],
       createdAt: now,
       updatedAt: now,
@@ -999,5 +999,35 @@ export async function PATCH(req) {
     return json(cleanDoc(normalizePaymentForResponse(updated)), 200, req);
   } catch (error) {
     return json({ message: "Failed to update payment", error: error.message }, 500, req);
+  }
+}
+
+export async function DELETE(req) {
+  const auth = requireAuth(req);
+  if (auth.error) return auth.error;
+
+  try {
+    const { searchParams } = new URL(req.url);
+    const id = normalizeId(searchParams.get("id") || searchParams.get("paymentId"));
+
+    if (!id) return json({ message: "Payment id is required" }, 400, req);
+
+    if (auth.user.role !== "Admin") {
+      return json({ message: "Only admin can delete/void payments" }, 403, req);
+    }
+
+    const query = normalizePaymentQuery(id);
+    if (!query) return json({ message: "Invalid payment id" }, 400, req);
+
+    const db = await getDb();
+    const payments = db.collection("payments");
+    const payment = await payments.findOne(query);
+
+    if (!payment) return json({ message: "Payment not found" }, 404, req);
+
+    await payments.deleteOne({ _id: payment._id });
+    return json({ ok: true }, 200, req);
+  } catch (error) {
+    return json({ message: "Failed to delete payment", error: error.message }, 500, req);
   }
 }

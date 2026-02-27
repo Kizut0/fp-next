@@ -887,21 +887,21 @@ export async function PATCH(req) {
       );
     }
 
-    if (isActivePaymentStatus(nextStatus)) {
-      const conflict = await findActiveConflict(payments, {
-        contractIds: contractIdCandidates,
-        milestoneKey,
-        excludeId: payment._id,
-      });
+    // if (isActivePaymentStatus(nextStatus)) {
+    //   const conflict = await findActiveConflict(payments, {
+    //     contractIds: contractIdCandidates,
+    //     milestoneKey,
+    //     excludeId: payment._id,
+    //   });
 
-      if (conflict) {
-        return json(
-          { message: "Only one active payment is allowed per contract/milestone" },
-          409,
-          req
-        );
-      }
-    }
+    //   if (conflict) {
+    //     return json(
+    //       { message: "Only one active payment is allowed per contract/milestone" },
+    //       409,
+    //       req
+    //     );
+    //   }
+    // }
 
     const providerBase =
       payment.provider && typeof payment.provider === "object" ? payment.provider : {};

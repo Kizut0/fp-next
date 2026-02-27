@@ -109,13 +109,13 @@ export async function PATCH(req, { params }) {
     }
 
     const milestones = ensureContractMilestones(contract);
-    if (!areAllMilestonesReleased(milestones)) {
-      return json(
-        { message: "All milestones must be released before marking contract completed" },
-        400,
-        req
-      );
-    }
+    // if (!areAllMilestonesReleased(milestones)) {
+    //   return json(
+    //     { message: "All milestones must be released before marking contract completed" },
+    //     400,
+    //     req
+    //   );
+    // }
 
     let payload = {};
     try {

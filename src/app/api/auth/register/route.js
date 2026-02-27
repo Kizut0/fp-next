@@ -1,6 +1,7 @@
 import { getDb } from "../../../../lib/mongodb";
 import { hashPassword, signToken } from "../../../../lib/auth";
 import { cleanDoc, json, options } from "../../../../lib/api";
+import { ensureUserIndexes, isDuplicateKeyError } from "../../../../lib/indexes";
 
 export const dynamic = "force-dynamic";
 
@@ -24,6 +25,7 @@ export async function POST(req) {
 
         const db = await getDb();
         const users = db.collection(process.env.USER_COLLECTION || "userData");
+        await ensureUserIndexes(users);
         const normalizedEmail = String(email).toLowerCase().trim();
 
         const existing = await users.findOne({ email: normalizedEmail });
@@ -56,6 +58,9 @@ export async function POST(req) {
 
         return json({ token, user: cleanDoc(user) }, 201);
     } catch (error) {
+        if (isDuplicateKeyError(error)) {
+            return json({ message: "Email already registered" }, 409);
+        }
         return json({ message: "Register failed", error: error.message }, 500);
     }
 }

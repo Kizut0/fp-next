@@ -1,5 +1,6 @@
 import { getDb } from "../../../lib/mongodb";
 import { cleanDoc, cleanDocs, json, options, requireAuth, toObjectId } from "../../../lib/api";
+import { ensureContractIndexes, isDuplicateKeyError } from "../../../lib/indexes";
 import {
   buildContractCompletionRequest,
   buildMilestoneSummary,
@@ -80,6 +81,7 @@ function getReservedAmount(proposal = {}) {
 
 function normalizeContractForResponse(contract) {
   const milestones = ensureContractMilestones(contract);
+  const changeOrders = Array.isArray(contract?.changeOrders) ? contract.changeOrders : [];
   return {
     ...contract,
     milestones,
@@ -88,6 +90,7 @@ function normalizeContractForResponse(contract) {
       milestones,
       contract?.completionRequest?.milestoneKey
     ),
+    changeOrders,
   };
 }
 
@@ -139,6 +142,7 @@ export async function POST(req) {
     const contracts = db.collection("contracts");
     const proposals = db.collection("proposals");
     const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
+    await ensureContractIndexes(contracts);
 
     if (proposalId) {
       const proposalQuery = resolveProposalQuery(proposalId);
@@ -238,6 +242,7 @@ export async function POST(req) {
         milestones: milestoneResult.milestones,
         milestoneSummary: buildMilestoneSummary(milestoneResult.milestones),
         completionRequest: buildContractCompletionRequest(milestoneResult.milestones),
+        changeOrders: [],
         status: "active",
         startDate: now,
         createdAt: now,
@@ -301,6 +306,7 @@ export async function POST(req) {
       milestones: milestoneResult.milestones,
       milestoneSummary: buildMilestoneSummary(milestoneResult.milestones),
       completionRequest: buildContractCompletionRequest(milestoneResult.milestones),
+      changeOrders: [],
       status: nextStatus,
       startDate,
       ...(endDate ? { endDate } : {}),
@@ -325,6 +331,9 @@ export async function POST(req) {
 
     return json(cleanDoc(normalizeContractForResponse({ ...doc, _id: inserted.insertedId })), 201, req);
   } catch (error) {
+    if (isDuplicateKeyError(error)) {
+      return json({ message: "Contract already exists for this proposal" }, 409, req);
+    }
     return json({ message: "Failed to create contract", error: error.message }, 500, req);
   }
 }

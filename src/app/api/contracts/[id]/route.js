@@ -11,7 +11,12 @@ import {
 export const dynamic = "force-dynamic";
 
 const STATUSES = ["active", "completed", "cancelled"];
-const NON_DELETABLE_CONTRACT_STATUSES = new Set(["accepted", "active", "completed"]);
+const NON_DELETABLE_CONTRACT_STATUSES = new Set([
+  "accepted",
+  "active",
+  "in_progress",
+  "completed",
+]);
 
 function normalizeStatus(value, fallback = "active") {
   const raw = String(value || fallback).trim().toLowerCase();
@@ -66,6 +71,7 @@ function canMutateContract(authUser, contract) {
 
 function normalizeContractForResponse(contract) {
   const milestones = ensureContractMilestones(contract);
+  const changeOrders = Array.isArray(contract?.changeOrders) ? contract.changeOrders : [];
   return {
     ...contract,
     milestones,
@@ -74,6 +80,7 @@ function normalizeContractForResponse(contract) {
       milestones,
       contract?.completionRequest?.milestoneKey
     ),
+    changeOrders,
   };
 }
 

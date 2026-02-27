@@ -1,5 +1,6 @@
 import { getDb } from "../../../../lib/mongodb";
 import { cleanDoc, json, options, requireAuth, toObjectId } from "../../../../lib/api";
+import { ensureProposalIndexes, isDuplicateKeyError } from "../../../../lib/indexes";
 
 export const dynamic = "force-dynamic";
 
@@ -147,6 +148,7 @@ export async function PUT(req, { params }) {
 
     const db = await getDb();
     const proposals = db.collection("proposals");
+    await ensureProposalIndexes(proposals);
     const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
     const proposal = await proposals.findOne(query);
     if (!proposal) return json({ message: "Proposal not found" }, 404, req);
@@ -216,6 +218,9 @@ export async function PUT(req, { params }) {
     const updated = await proposals.findOne({ _id: proposal._id });
     return json(cleanDoc(updated), 200, req);
   } catch (error) {
+    if (isDuplicateKeyError(error)) {
+      return json({ message: "Another active proposal already exists for this job and freelancer" }, 409, req);
+    }
     return json({ message: "Failed to update proposal", error: error.message }, 500, req);
   }
 }

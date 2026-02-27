@@ -1,5 +1,6 @@
 import { getDb } from "../../../lib/mongodb";
 import { cleanDoc, cleanDocs, json, options, requireAuth, toObjectId } from "../../../lib/api";
+import { ensureReviewIndexes, isDuplicateKeyError } from "../../../lib/indexes";
 
 export const dynamic = "force-dynamic";
 
@@ -83,6 +84,8 @@ export async function POST(req) {
     }
 
     const db = await getDb();
+    const reviews = db.collection("reviews");
+    await ensureReviewIndexes(reviews);
     const contractQuery = normalizeContractQuery(contractId);
     if (!contractQuery) return json({ message: "Invalid contract id" }, 400, req);
 
@@ -121,7 +124,7 @@ export async function POST(req) {
     }
 
     const canonicalContractId = normalizeId(contract._id || contract.contractId || contractId);
-    const existing = await db.collection("reviews").findOne({
+    const existing = await reviews.findOne({
       contractId: { $in: [canonicalContractId, contractId].filter(Boolean) },
       reviewerId: normalizeId(auth.user.id),
       revieweeId,
@@ -141,9 +144,12 @@ export async function POST(req) {
       updatedAt: now,
     };
 
-    const result = await db.collection("reviews").insertOne(doc);
+    const result = await reviews.insertOne(doc);
     return json(cleanDoc({ ...doc, _id: result.insertedId }), 201, req);
   } catch (error) {
+    if (isDuplicateKeyError(error)) {
+      return json({ message: "Review already submitted for this contract" }, 409, req);
+    }
     return json({ message: "Failed to create review", error: error.message }, 500, req);
   }
 }

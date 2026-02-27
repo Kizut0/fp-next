@@ -1,5 +1,6 @@
 import { getDb } from "../../../lib/mongodb";
 import { cleanDoc, cleanDocs, json, options, requireAuth, toObjectId } from "../../../lib/api";
+import { ensureProposalIndexes, isDuplicateKeyError } from "../../../lib/indexes";
 
 export const dynamic = "force-dynamic";
 
@@ -144,6 +145,7 @@ export async function POST(req) {
 
     const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
     const proposals = db.collection("proposals");
+    await ensureProposalIndexes(proposals);
 
     const jobQuery = resolveJobLookup(jobId);
     if (!jobQuery) return json({ message: "Invalid job id" }, 400, req);
@@ -206,6 +208,9 @@ export async function POST(req) {
 
     return json(cleanDoc({ ...doc, _id: result.insertedId }), 201, req);
   } catch (error) {
+    if (isDuplicateKeyError(error)) {
+      return json({ message: "You already have an active proposal for this job" }, 409, req);
+    }
     return json({ message: "Failed to submit proposal", error: error.message }, 500, req);
   }
 }

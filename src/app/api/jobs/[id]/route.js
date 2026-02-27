@@ -10,7 +10,7 @@ const DEFAULTS = {
   duration: "1 to 3 months",
   locationType: "Remote",
 };
-const NON_DELETABLE_JOB_STATUSES = new Set(["accepted", "active", "completed"]);
+const COMMITTED_JOB_STATUSES = new Set(["accepted", "active", "in_progress", "completed"]);
 
 const JOB_STATUSES = ["draft", "open", "in_progress", "completed", "cancelled"];
 const JOB_STATUS_ALIASES = {
@@ -84,7 +84,7 @@ function normalizeStatus(value, fallback = "open") {
 
 function isDeleteRestrictedJob(job) {
   const status = String(job?.status || "").trim().toLowerCase();
-  if (NON_DELETABLE_JOB_STATUSES.has(status)) return true;
+  if (COMMITTED_JOB_STATUSES.has(status)) return true;
 
   return Boolean(String(job?.acceptedProposalId || "").trim());
 }
@@ -388,7 +388,9 @@ export async function DELETE(req, { params }) {
     if (!isAdmin && !isOwnedByUser(existing, auth.user)) {
       return json({ message: "Forbidden" }, 403, req);
     }
-    if (isDeleteRestrictedJob(existing)) {
+
+    const hasCommitment = isDeleteRestrictedJob(existing) || (await hasAcceptedProposalOrContract(db, existing));
+    if (hasCommitment) {
       return json(
         { message: "Accepted, active, or completed jobs cannot be deleted. Use archive/cancel policy." },
         409,
@@ -400,11 +402,6 @@ export async function DELETE(req, { params }) {
       const status = normalizeStatus(existing.status, "open");
       if (status !== "open") {
         return json({ message: "Only open jobs can be deleted by client" }, 409, req);
-      }
-
-      const locked = await hasAcceptedProposalOrContract(db, existing);
-      if (locked) {
-        return json({ message: "Job is locked because a proposal has been accepted" }, 409, req);
       }
     }
 

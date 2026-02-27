@@ -1,6 +1,11 @@
 import { getDb } from "../../../../../lib/mongodb";
 import { cleanDoc, json, options, requireAuth, toObjectId } from "../../../../../lib/api";
 import {
+  ensureContractIndexes,
+  ensureProposalIndexes,
+  isDuplicateKeyError,
+} from "../../../../../lib/indexes";
+import {
   buildContractCompletionRequest,
   buildMilestoneSummary,
   ensureContractMilestones,
@@ -71,6 +76,7 @@ function getReservedAmount(proposal = {}) {
 
 function normalizeContractForResponse(contract) {
   const milestones = ensureContractMilestones(contract);
+  const changeOrders = Array.isArray(contract?.changeOrders) ? contract.changeOrders : [];
   return {
     ...contract,
     milestones,
@@ -79,6 +85,7 @@ function normalizeContractForResponse(contract) {
       milestones,
       contract?.completionRequest?.milestoneKey
     ),
+    changeOrders,
   };
 }
 
@@ -110,6 +117,8 @@ export async function PATCH(req, { params }) {
     const proposals = db.collection("proposals");
     const jobs = db.collection(process.env.JOB_COLLECTION || "Job");
     const contracts = db.collection("contracts");
+    await ensureProposalIndexes(proposals);
+    await ensureContractIndexes(contracts);
 
     const proposal = await proposals.findOne(normalizeProposalQuery(rawId));
 
@@ -227,6 +236,7 @@ export async function PATCH(req, { params }) {
         milestones: milestoneResult.milestones,
         milestoneSummary: buildMilestoneSummary(milestoneResult.milestones),
         completionRequest: buildContractCompletionRequest(milestoneResult.milestones),
+        changeOrders: [],
         status: "active",
         startDate: now,
         createdAt: now,
@@ -239,6 +249,16 @@ export async function PATCH(req, { params }) {
 
     return json({ ok: true, contract: cleanDoc(normalizeContractForResponse(contract)) }, 200, req);
   } catch (error) {
+    if (isDuplicateKeyError(error)) {
+      const keyPattern = error?.keyPattern || {};
+      if (keyPattern?.proposalId) {
+        return json({ message: "Contract already exists for this proposal" }, 409, req);
+      }
+      if (keyPattern?.jobId || keyPattern?.freelancerId) {
+        return json({ message: "Another active proposal already exists for this job and freelancer" }, 409, req);
+      }
+      return json({ message: "Duplicate key conflict while accepting proposal" }, 409, req);
+    }
     return json({ message: "Failed to accept proposal", error: error.message }, 500, req);
   }
 }

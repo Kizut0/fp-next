@@ -1,5 +1,6 @@
 import { getDb } from "../../../../../lib/mongodb";
 import { cleanDoc, json, options, requireAuth, toObjectId } from "../../../../../lib/api";
+import { areAllMilestonesReleased, ensureContractMilestones } from "../../../../../lib/contractMilestones";
 
 export const dynamic = "force-dynamic";
 
@@ -105,6 +106,15 @@ export async function PATCH(req, { params }) {
 
     if (!canCompleteContract(auth.user, contract)) {
       return json({ message: "Forbidden" }, 403, req);
+    }
+
+    const milestones = ensureContractMilestones(contract);
+    if (!areAllMilestonesReleased(milestones)) {
+      return json(
+        { message: "All milestones must be released before marking contract completed" },
+        400,
+        req
+      );
     }
 
     let payload = {};
